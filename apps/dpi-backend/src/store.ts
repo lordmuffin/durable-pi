@@ -62,6 +62,7 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import { createPlayground, Workspace, type SpawnSession } from "./extensions.js";
 import { createJobs, JobRuns, JOB_DEFS, jobDef, resolveJobInput, type Jobs } from "./jobs.js";
 import { ADDON_INFO, createAddons, PROMPTS, PromptChecklist, type Addons } from "./addons.js";
+import { createGuard, guardEnabled } from "./guard.js";
 import { JOB_RUNS_DOC } from "../../dpi-sdk/src/jobs.js";
 
 export const DURABLE_VERSION = "1.0.3";
@@ -529,8 +530,12 @@ export class Store {
       const playground = createPlayground(this.shared, row.id, this.spawnSession, jobs);
       registry.install(playground);
       // Custom extensions are installed but not selected: an agent turns them on in its own selection.
-      const addons = createAddons({ offline: this.options.provider === "faux" });
+      const offline = this.options.provider === "faux";
+      const addons = createAddons({ offline, shared: this.shared, sessionId: row.id });
       for (const extension of addons.list) registry.install(extension);
+      // DPI_GUARD=on: every agent starts with homelab-guard selected; the Extend tab cannot remove it.
+      const guard = guardEnabled() ? createGuard({ offline: offline && !process.env.JEV_BASE_URL }) : undefined;
+      if (guard) registry.install(guard);
       const harness = await Harness.open(
         await openNodeSqliteStorage(row.dbPath),
         {
@@ -542,7 +547,7 @@ export class Store {
             await tx.doc(JobRuns, c.id);
           },
           settings: {
-            extensions: [CodingTools, playground],
+            extensions: guard ? [CodingTools, playground, guard] : [CodingTools, playground],
             // Read at every use, so a PATCH .../compaction applies from the next request.
             get compaction() {
               return compaction();
