@@ -43,6 +43,11 @@ if (host !== "127.0.0.1" && host !== "localhost") {
       if (a.family === "IPv4") allowedHosts.add(`${a.address}:${port}`);
 }
 
+// Behind a reverse proxy that authenticates users (e.g. Traefik + forward-auth), name the public
+// host(s) here, comma-separated, exactly as browsers send them: DPI_HUB_ALLOWED_HOSTS=pi.lab.apj.dev
+for (const extra of (process.env.DPI_HUB_ALLOWED_HOSTS ?? "").split(","))
+  if (extra.trim()) allowedHosts.add(extra.trim().toLowerCase());
+
 const err = (code: string, message: string) => ({ error: { code, message } });
 type Handler = (req: express.Request, res: express.Response) => unknown;
 const safe =
