@@ -9,6 +9,8 @@ import { join } from "node:path";
 import { defineDoc, defineExtension, hook, section, ToolTask, type Extension } from "@earendil-works/pi-durable";
 import type { HarnessExtensionInfo } from "../../dpi-sdk/src/api.js";
 import { askJev, type JevAnswer, type JevQuestion } from "./jev.js";
+import { createIncident, INCIDENT_NAME } from "./incident.js";
+import type { SharedState } from "./shared-state.js";
 
 const PROMPTS_DIR = join(import.meta.dirname, "../prompts");
 
@@ -38,7 +40,7 @@ export const PromptChecklist = defineDoc<{ enabled: string[] }>({
 // ------------------------------------------------------------------ jev-damage-control
 
 /** The jev-bash gate's questions and thresholds (harness/extensions/jev-bash/bash-gate.ts). */
-const BASH_QUESTIONS: Record<string, JevQuestion> = {
+export const BASH_QUESTIONS: Record<string, JevQuestion> = {
   effect: {
     type: "choice",
     instructions: "What does running `command` do to the machine?",
@@ -61,7 +63,7 @@ const BASH_QUESTIONS: Record<string, JevQuestion> = {
 
 type Verdict = { block: boolean; reason: string };
 
-function gate(a: Record<string, JevAnswer>): Verdict {
+export function gate(a: Record<string, JevAnswer>): Verdict {
   const effect = a.effect as Extract<JevAnswer, { type: "choice" }>;
   const destructive = (a.destructive_intent as Extract<JevAnswer, { type: "noul" }>).noul;
   if (effect.choice === "irreversible" && effect.confidence >= 0.6)
@@ -73,7 +75,7 @@ function gate(a: Record<string, JevAnswer>): Verdict {
 
 /** The faux provider's stand-in for Jev, so tests and offline demos never call the network. */
 const OFFLINE_DANGER = /\brm\s+-[a-z]*[rf]|\bgit\s+push\b.*--force|\bgit\s+reset\s+--hard|\bdropdb\b|\bmkfs|\bdd\s+.*of=|\btruncate\b/;
-async function judgeOffline(command: string): Promise<Verdict> {
+export async function judgeOffline(command: string): Promise<Verdict> {
   return OFFLINE_DANGER.test(command)
     ? { block: true, reason: "destructive intent (offline rules): this command aims to wipe something" }
     : { block: false, reason: "allowed (offline rules)" };
@@ -93,9 +95,15 @@ export const ADDON_INFO: Omit<HarnessExtensionInfo, "enabled" | "prompts">[] = [
     description:
       "Before every bash call, Jev judges the command in about 300 ms and blocks irreversible or destructive ones. The decision is a durable memo, so a restart never re-asks. If Jev is down, commands run.",
   },
+  {
+    name: INCIDENT_NAME,
+    title: "Homelab incident",
+    description:
+      "k8s_read (kubectl get/describe/logs, flux get as a view-only ServiceAccount), save_rca (App State /incidents only) and notify (ntfy). Pair it with Read only.",
+  },
 ];
 
-export function createAddons(opts: { offline: boolean }) {
+export function createAddons(opts: { offline: boolean; shared: SharedState; sessionId: string }) {
   const prompts = defineExtension({
     name: "system-prompts",
     sections: [
@@ -111,7 +119,7 @@ export function createAddons(opts: { offline: boolean }) {
       ),
     ],
   });
-  const judge = opts.offline ? judgeOffline : async (command: string) => gate(await askJev({ command }, BASH_QUESTIONS));
+  const judge = opts.offline && !process.env.JEV_BASE_URL ? judgeOffline : async (command: string) => gate(await askJev({ command }, BASH_QUESTIONS));
   const jev = defineExtension({
     name: "jev-damage-control",
     hooks: [
@@ -124,7 +132,10 @@ export function createAddons(opts: { offline: boolean }) {
             try {
               verdict = await api.memo<Verdict>("jev-damage-control", await judge(command), ctx);
             } catch {
-              return; // Fails open: a Jev outage must not stop bash.
+              // Fails open (a Jev outage must not stop bash) unless DPI_JEV_FAIL_CLOSED=1.
+              if (process.env.DPI_JEV_FAIL_CLOSED === "1")
+                return { block: "jev-damage-control: Jev is unreachable, so bash is blocked (DPI_JEV_FAIL_CLOSED=1)" };
+              return;
             }
           }
           if (verdict.block) return { block: `jev-damage-control blocked this command: ${verdict.reason}` };
@@ -132,8 +143,9 @@ export function createAddons(opts: { offline: boolean }) {
       }),
     ],
   });
-  const all: Record<string, Extension> = { "system-prompts": prompts, "jev-damage-control": jev };
-  return { all, list: [prompts, jev] };
+  const incident = createIncident(opts.shared, opts.sessionId);
+  const all: Record<string, Extension> = { "system-prompts": prompts, "jev-damage-control": jev, [INCIDENT_NAME]: incident };
+  return { all, list: [prompts, jev, incident] };
 }
 
 export type Addons = ReturnType<typeof createAddons>;

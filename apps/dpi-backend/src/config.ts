@@ -13,9 +13,12 @@ export interface BackendConfig {
   envFile: string;
   dataDir: string;
   startDirs: string[];
-  provider: "openrouter" | "faux";
+  provider: Provider;
   token: string;
 }
+
+export type Provider = "openrouter" | "faux" | "openai-compatible";
+const PROVIDERS: Provider[] = ["openrouter", "faux", "openai-compatible"];
 
 const expand = (p: string) => (p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 
@@ -41,9 +44,11 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env): Bac
       .split(":")
       .filter(Boolean)
       .map((p) => resolve(expand(p))),
-    provider: (env.DPI_PROVIDER ?? "openrouter") === "faux" ? "faux" : "openrouter",
+    provider: (env.DPI_PROVIDER ?? "openrouter") as Provider,
     token: env.DPI_TOKEN ?? "",
   };
+  if (!PROVIDERS.includes(config.provider))
+    throw Error(`Invalid DPI_PROVIDER: ${config.provider} (one of ${PROVIDERS.join(", ")})`);
   if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535)
     throw Error(`Invalid port: ${config.port}`);
   if (config.token.length < 32)

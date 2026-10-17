@@ -30,6 +30,7 @@ import {
   type JobStepKind,
 } from "../../dpi-sdk/src/jobs.js";
 import type { SharedState } from "./shared-state.js";
+import { hardDeny } from "./guard.js";
 
 export const JobRuns = defineDoc<JobRunsDoc>({
   kind: JOB_RUNS_DOC,
@@ -117,6 +118,24 @@ export const JOB_DEFS: JobDef[] = [
     resultPath: `/${RESULT_ROOT}/change-watch`,
     seconds: 25,
   },
+  {
+    id: "approve-irreversible",
+    title: "Approve an irreversible step",
+    summary:
+      "Run one shell command that homelab-guard blocked, but only after a person approves it in the playground. Posts the request to ntfy with a link. Hard-denied commands never run.",
+    phases: [
+      { id: "request", label: "Request", summary: "Check the command against the hard-deny list and post the approval request" },
+      { id: "approve", label: "Approve", summary: "Wait for a person to approve in the playground", kind: "approval" },
+      { id: "execute", label: "Execute", summary: "Run the approved command once" },
+    ],
+    inputs: [
+      { name: "command", type: "string", default: "", description: "The exact shell command to run after approval" },
+      { name: "reason", type: "string", default: "", description: "Why this step is needed, shown to the approver" },
+    ],
+    approval: true,
+    resultPath: `/${RESULT_ROOT}/approve-irreversible`,
+    seconds: 10,
+  },
 ];
 
 export const jobDef = (id: string) => JOB_DEFS.find((d) => d.id === id);
@@ -152,6 +171,8 @@ interface Phase {
   readonly data: Data;
   readonly iteration: number;
   readonly run: { id: number; n: number };
+  /** Where the run lives, for links back to its approval card. */
+  readonly where: { sessionId: string; conversationId: number };
   now(): number;
   /** Run a shell command in the session's folder and record it as a step. Throws on a non-zero exit. */
   exec(command: string, label?: string): Promise<string>;
@@ -320,6 +341,53 @@ const HANDLERS: Record<string, Record<string, Handler>> = {
   },
 };
 
+// approve-irreversible env: DPI_APPROVAL_NTFY_URL (topic URL to post the request to; unset = playground card only)
+// and DPI_APPROVAL_URL (the playground's public URL, linked from the message). The approval itself only happens
+// in the playground, behind its login: a tap-to-approve ntfy action would let anyone who can read the topic approve.
+HANDLERS["approve-irreversible"] = {
+  request: async (p) => {
+    const command = String(p.input.command).trim();
+    const reason = String(p.input.reason).trim();
+    if (!command) throw Error("command is required");
+    if (!reason) throw Error("reason is required");
+    const denied = hardDeny(command);
+    if (denied) throw Error(`hard-deny: ${denied}. Approval cannot override this.`);
+    const topic = process.env.DPI_APPROVAL_NTFY_URL;
+    if (topic)
+      await p.step("tool", "notify the approver (ntfy)", async () => {
+        const link = process.env.DPI_APPROVAL_URL;
+        const res = await fetch(topic, {
+          method: "POST",
+          headers: {
+            Title: `Approval needed: job run #${p.run.n} (session ${p.where.sessionId.slice(0, 8)})`,
+            Priority: "high",
+            Tags: "warning,lock",
+            ...(link ? { Click: link, Actions: `view, Review in playground, ${link}` } : {}),
+          },
+          body: clip(`${reason}\n\n$ ${command}`, 1500),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!res.ok) throw Error(`ntfy HTTP ${res.status}`);
+        return { value: undefined, detail: topic };
+      });
+    return { done: clip(`Waiting on approval for: ${command}`, 120), data: { command } };
+  },
+  approve: async () => {
+    throw Error("approval phases run in the engine");
+  },
+  execute: async (p) => {
+    const command = String(p.data.command);
+    const out = await p.exec(command);
+    await p.saveState(`/${RESULT_ROOT}/approve-irreversible`, {
+      run: p.run.n,
+      at: new Date(p.now()).toISOString(),
+      command,
+      output: clip(out, 2000),
+    });
+    return { done: clip(`Ran: ${command}`, 120) };
+  },
+};
+
 function checksums(out: string) {
   const map: Record<string, string> = {};
   for (const line of out.split("\n")) {
@@ -442,6 +510,7 @@ export function createJobs(deps: JobsDeps) {
       data: cp.data,
       iteration: cp.iteration,
       run: { id: task.id as number, n: run.run },
+      where: { sessionId: deps.sessionId, conversationId: task.conversationId as number },
       now: () => runtime.now(),
       shell,
       step,
