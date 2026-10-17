@@ -45,7 +45,7 @@ export async function freePort() {
 export const newToken = () => `dpi_${randomBytes(32).toString("base64url")}`;
 
 /** Boot the real backend as a child process (faux provider, temp DPI_HOME). */
-export async function bootServer(opts: { home: string; startDirs: string; token: string; port?: number; name?: string; cwd?: string }) {
+export async function bootServer(opts: { home: string; startDirs: string; token: string; port?: number; name?: string; cwd?: string; env?: NodeJS.ProcessEnv }) {
   const port = opts.port ?? (await freePort());
   const base = `http://127.0.0.1:${port}`;
   let child: ChildProcess | undefined;
@@ -60,6 +60,7 @@ export async function bootServer(opts: { home: string; startDirs: string; token:
         DPI_PROVIDER: "faux",
         DPI_START_DIRS: opts.startDirs,
         DPI_DEVICE_NAME: opts.name ?? "test-device",
+        ...opts.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
       cwd: opts.cwd ?? resolve(import.meta.dirname, ".."),

@@ -40,6 +40,8 @@ import { BACKGROUND_CONTEXT as ctx, withAbortSignal } from "@earendil-works/chor
 import { createModels } from "@earendil-works/pi-ai/models";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 import { curatedModels, defaultModelId } from "./model-catalog.js";
+import { OPENAI_COMPATIBLE, openAICompatibleConfig, openAICompatibleProvider } from "./openai-compatible.js";
+import type { Provider } from "./config.js";
 import { fauxModels, installFaux } from "./faux.js";
 import {
   Harness,
@@ -90,8 +92,10 @@ export interface StoreOptions {
   dataDir: string;
   startDirs: string[];
   name: string;
-  provider: "openrouter" | "faux";
+  provider: Provider;
 }
+
+type CuratedModel = { id: string; name: string; tier: string; icon: string };
 
 /** Agent documents a client may read or stream, by kind. */
 /** apps/dpi-backend/src → the checkout root. */
@@ -154,6 +158,10 @@ export class Store {
   private listeners = new Set<() => void>();
   /** Saved thresholds per session; null when the session uses the defaults for its model. */
   private compactions = new Map<string, Partial<CompactionSettings> | null>();
+  /** The chat provider id, its listed models and the default model (none of these apply to faux). */
+  private providerId = "openrouter";
+  private curated: readonly CuratedModel[] = curatedModels;
+  private defaultId: string = defaultModelId;
   /** Task labels never change once known: tool names of pi.tool tasks, job titles of job runs. */
   private taskLabels = new Map<string, { label?: string; callId?: string }>();
 
@@ -178,7 +186,13 @@ export class Store {
 
   private constructor(readonly options: StoreOptions) {
     if (options.provider === "faux") installFaux(this.models);
-    else {
+    else if (options.provider === OPENAI_COMPATIBLE) {
+      const config = openAICompatibleConfig();
+      this.models.setProvider(openAICompatibleProvider(config));
+      this.providerId = OPENAI_COMPATIBLE;
+      this.curated = config.models.map((id) => ({ id, name: id, tier: "L", icon: "lab.png" }));
+      this.defaultId = config.defaultModel;
+    } else {
       const provider = openrouterProvider();
       const catalog = provider.getModels();
       for (const model of curatedModels)
@@ -264,7 +278,7 @@ export class Store {
   }
 
   private defaultModel() {
-    return this.options.provider === "faux" ? fauxModels[0].id : defaultModelId;
+    return this.options.provider === "faux" ? fauxModels[0].id : this.defaultId;
   }
 
   private async loadModels(): Promise<ModelInfo[]> {
@@ -279,14 +293,14 @@ export class Store {
         reasoning: false,
         cost: { input: 0, output: 0 },
       }));
-    const available = await this.models.getAvailable("openrouter", { signal: AbortSignal.timeout(10000) });
-    return curatedModels.flatMap((c) => {
+    const available = await this.models.getAvailable(this.providerId, { signal: AbortSignal.timeout(10000) });
+    return this.curated.flatMap((c) => {
       const m = available.find((m) => m.id === c.id);
       return m
         ? [
             {
               id: m.id,
-              provider: "openrouter",
+              provider: this.providerId,
               name: c.name,
               tier: c.tier,
               icon: c.icon,
@@ -304,6 +318,11 @@ export class Store {
       const id = fauxModels.some((m) => m.id === model?.modelId) ? model!.modelId : fauxModels[0].id;
       return { provider: "faux", modelId: id };
     }
+    if (this.providerId === OPENAI_COMPATIBLE)
+      return {
+        provider: OPENAI_COMPATIBLE,
+        modelId: this.curated.some((m) => m.id === model?.modelId) ? model!.modelId : this.defaultId,
+      };
     const exact = model?.provider === "openrouter" ? model.modelId : `${model?.provider}/${model?.modelId}`;
     return {
       provider: "openrouter",
@@ -318,8 +337,8 @@ export class Store {
     const known =
       this.options.provider === "faux"
         ? m.provider === "faux" && fauxModels.some((f) => f.id === m.modelId)
-        : m.provider === "openrouter" &&
-          curatedModels.some((c) => c.id === m.modelId) &&
+        : m.provider === this.providerId &&
+          this.curated.some((c) => c.id === m.modelId) &&
           !!this.models.getModel(m.provider, m.modelId);
     if (!known) throw invalid(`Unknown model ${m.provider}/${m.modelId}. Choose one from GET /v1/device models`);
     return { provider: m.provider, modelId: m.modelId };
