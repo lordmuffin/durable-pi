@@ -13,6 +13,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { defineDoc, defineExtension, defineTool, section, type ToolRegistration } from "@earendil-works/pi-durable";
 import type { SharedState } from "./shared-state.js";
 import { gitopsConfig, gitopsRead, proposeFix, type FixArgs } from "./gitops.js";
+import { renderFacts } from "./facts.js";
 
 export const INCIDENT_NAME = "homelab-incident";
 
@@ -294,6 +295,10 @@ export function createIncident(shared: SharedState, sessionId: string, gitops = 
   return defineExtension({
     name: INCIDENT_NAME,
     tools,
-    sections: [section(INCIDENT_NAME, async () => (gitops ? `${INCIDENT_PROMPT}\n\n${FIX_PROMPT}` : INCIDENT_PROMPT), { tag: false })],
+    sections: [
+      // Facts first: the agent should know the homelab's current state before the incident prompt below.
+      section("homelab-facts", async () => renderFacts((await shared.snapshot()).value), { tag: false }),
+      section(INCIDENT_NAME, async () => (gitops ? `${INCIDENT_PROMPT}\n\n${FIX_PROMPT}` : INCIDENT_PROMPT), { tag: false }),
+    ],
   });
 }

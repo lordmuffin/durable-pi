@@ -97,6 +97,7 @@ test("REST v1: auth, sessions, agents, messages, waits, idempotency, errors", as
       "change-watch",
       "approve-irreversible",
       "homelab-digest",
+      "profile-verify",
     ]);
     const runs = async () => (await main.doc<JobRunsDoc>("demo.job-runs")).value.items;
     const job = await main.demo<{ taskId: number }>("jobs", { job: "workspace-snapshot" });
