@@ -91,7 +91,13 @@ test("REST v1: auth, sessions, agents, messages, waits, idempotency, errors", as
 
     // Demo extension + docs.
     // Durable jobs: definitions on the device, a run started by a client, then one started by the agent's tool.
-    assert.deepEqual((await client.device()).jobs?.map((j) => j.id), ["workspace-snapshot", "release-check", "change-watch", "approve-irreversible"]);
+    assert.deepEqual((await client.device()).jobs?.map((j) => j.id), [
+      "workspace-snapshot",
+      "release-check",
+      "change-watch",
+      "approve-irreversible",
+      "velero-restore-drill",
+    ]);
     const runs = async () => (await main.doc<JobRunsDoc>("demo.job-runs")).value.items;
     const job = await main.demo<{ taskId: number }>("jobs", { job: "workspace-snapshot" });
     await until(async () => (await runs())[job.taskId]?.status === "completed", 15000, "job");
