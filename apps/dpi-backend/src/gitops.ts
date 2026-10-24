@@ -64,7 +64,8 @@ export function applyEdit(path: string, text: string, oldString: string, newStri
 /** The alert-fingerprint part of an incident id (inc-<fp8>-<ts>), shared by every firing of the same alert. */
 export const fingerprintOf = (incidentId: string) => incidentId.match(/^inc-([0-9a-f]{8})/)?.[1];
 
-async function call<T>(cfg: GitopsConfig, method: string, path: string, body?: unknown): Promise<T> {
+/** A raw Forgejo API call against this repo. Exported so other proposers (e.g. gpu-profiles.ts) share one client. */
+export async function callForgejo<T>(cfg: GitopsConfig, method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${cfg.api}/repos/${cfg.repo}${path}`, {
     method,
     headers: { Authorization: `token ${cfg.token}`, Accept: "application/json", ...(body ? { "Content-Type": "application/json" } : {}) },
@@ -79,10 +80,10 @@ async function call<T>(cfg: GitopsConfig, method: string, path: string, body?: u
 type Entry = { type: string; path: string; name: string; size?: number; content?: string; sha: string };
 const enc = (p: string) => p.split("/").map(encodeURIComponent).join("/");
 
-/** One file's text and blob sha on the base branch, or undefined when it does not exist. */
-async function getFile(cfg: GitopsConfig, path: string) {
+/** One file's text and blob sha on the base branch, or undefined when it does not exist. Exported for reuse. */
+export async function getFile(cfg: GitopsConfig, path: string) {
   try {
-    const e = await call<Entry>(cfg, "GET", `/contents/${enc(path)}?ref=${encodeURIComponent(cfg.base)}`);
+    const e = await callForgejo<Entry>(cfg, "GET", `/contents/${enc(path)}?ref=${encodeURIComponent(cfg.base)}`);
     if (Array.isArray(e) || e.type !== "file") throw Error(`${path} is a directory`);
     return { text: Buffer.from(e.content ?? "", "base64").toString("utf8"), sha: e.sha };
   } catch (err) {
@@ -94,7 +95,7 @@ async function getFile(cfg: GitopsConfig, path: string) {
 /** A file's text, or a directory listing, on the base branch. */
 export async function gitopsRead(cfg: GitopsConfig, path: string) {
   const p = readPath(path);
-  const e = await call<Entry | Entry[]>(cfg, "GET", `/contents/${p ? enc(p) : ""}?ref=${encodeURIComponent(cfg.base)}`);
+  const e = await callForgejo<Entry | Entry[]>(cfg, "GET", `/contents/${p ? enc(p) : ""}?ref=${encodeURIComponent(cfg.base)}`);
   if (Array.isArray(e)) return e.map((x) => `${x.type === "dir" ? "d" : "f"} ${x.path}`).join("\n") || "(empty directory)";
   const text = Buffer.from(e.content ?? "", "base64").toString("utf8");
   return text.length > 20_000 ? `${text.slice(0, 20_000)}\n… (${text.length - 20_000} more characters cut)` : text;
@@ -153,19 +154,19 @@ export async function proposeFix(cfg: GitopsConfig, a: FixArgs, meta: { session:
     `---\nProposed by the homelab-incident agent (session \`${meta.session.slice(0, 8)}\`). Check CI and the diff before merging; Flux applies it on merge.`,
   ].join("\n");
 
-  const open = await call<Pull[]>(cfg, "GET", `/pulls?state=open&limit=50`);
+  const open = await callForgejo<Pull[]>(cfg, "GET", `/pulls?state=open&limit=50`);
   const ours = open.filter((p) => p.head?.ref?.startsWith("jev/"));
   const fp = fingerprintOf(id);
   const same = fp && ours.find((p) => p.head.ref.startsWith(`jev/inc-${fp}`));
   if (same) {
-    await call(cfg, "POST", `/issues/${same.number}/comments`, { body: `The alert fired again as \`${id}\`. Proposed fix:\n\n**${title}**\n\n${body}` });
+    await callForgejo(cfg, "POST", `/issues/${same.number}/comments`, { body: `The alert fired again as \`${id}\`. Proposed fix:\n\n**${title}**\n\n${body}` });
     return { kind: "commented", number: same.number, url: same.html_url };
   }
   if (ours.length >= cfg.maxOpen)
     throw Error(`${ours.length} jev/ PRs are already open (limit ${cfg.maxOpen}). Put the fix in the RCA remediation instead.`);
 
   const branch = `jev/${id}`;
-  await call(cfg, "POST", "/contents", {
+  await callForgejo(cfg, "POST", "/contents", {
     branch: cfg.base,
     new_branch: branch,
     message: `fix(${id}): ${title}`,
@@ -176,9 +177,9 @@ export async function proposeFix(cfg: GitopsConfig, a: FixArgs, meta: { session:
       ...(f.sha ? { sha: f.sha } : {}),
     })),
   });
-  const pr = await call<Pull>(cfg, "POST", "/pulls", { base: cfg.base, head: branch, title: `fix(${id}): ${title}`, body });
+  const pr = await callForgejo<Pull>(cfg, "POST", "/pulls", { base: cfg.base, head: branch, title: `fix(${id}): ${title}`, body });
   // Best effort: the label only helps filtering.
-  await call(cfg, "POST", `/issues/${pr.number}/labels`, { labels: ["jev-proposed"] }).catch(() => undefined);
+  await callForgejo(cfg, "POST", `/issues/${pr.number}/labels`, { labels: ["jev-proposed"] }).catch(() => undefined);
   return { kind: "opened", number: pr.number, url: pr.html_url, branch };
 }
 
