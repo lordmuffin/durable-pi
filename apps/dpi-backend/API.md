@@ -61,6 +61,8 @@ A durable job is a repeatable workflow with named phases. Each run is one pi-dur
 | `workspace-snapshot` | scan → measure → save → verify | `path` |
 | `release-check` | plan → gather (subagent with read and bash) → approve (waits for a person) → publish → verify | `commits` |
 | `change-watch` | baseline → watch (one checkpoint per check) → report | `path`, `checks`, `interval_seconds` |
+| `approve-irreversible` | request → approve (waits for a person) → execute | `command`, `reason` |
+| `velero-restore-drill` | pick → plan → approve (waits) → restore → verify → cleanup-approve (waits) → cleanup | `namespace`, `location` |
 
 Agents use the playground tools: `list_durable_jobs` (ids, phases, inputs, approval, result path and recent runs with their task ids), `run_durable_job {job, input?, wait?}` and `check_durable_job {task_id? | job?}` (one run's phases, steps and result, a job's latest run, or recent runs). A run starts in the background, owned by the conversation; with `wait: true` the call owns it and waits, so an interrupt stops it. The same extension adds `search_history {query?, tool?, entry?, kind?, from_entry?, to_entry?, order?, limit?, offset?}`, which pages through the agent's whole stored history including entries before a reset or compaction, and `ping_on_call_engineer {summary, severity?}`, a simulated pager (no external call) that is not replay-safe and works once per agent.
 
