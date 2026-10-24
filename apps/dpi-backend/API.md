@@ -21,6 +21,7 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 | `GET /v1/events` | `?docs=app.shared-state` | device stream |
 | `GET /v1/fs/dirs` | `?path=` (empty = start dirs) | `{path, parent, dirs[]}`, one level, directories only |
 | `GET /v1/docs/app.shared-state` | | `{kind, value, revision}` |
+| `POST /v1/facts/:key` | `{value, source, expectedRevision?}` | `{ok, key, value, updatedAt, source}`: writes App State `/facts/:key`. `key` must be one of the fixed keys in `src/facts.ts` (`FACT_SCHEMA`); `value` must match that key's declared type (string ≤200 chars, number, or boolean); `source` is a short label, ≤100 chars. A stale `expectedRevision` returns `409 conflict` — re-read `GET /v1/docs/app.shared-state` and retry. This is the *only* way to change a fact: no agent tool writes `/facts` (`facts_write` is a REST-only capability), so agents read facts (via `read_state` or this GET) but edit them only through the automation that owns each key |
 | `GET /v1/sessions` | | `SessionSummary[]` |
 | `POST /v1/sessions` | `{name, cwd, model:{provider,modelId}, thinkingLevel?}` | `201 SessionSummary` |
 | `GET / PATCH / DELETE /v1/sessions/:s` | PATCH `{name}` | summary (with its `compaction` thresholds); DELETE aborts all work, moves the files to `archive/` and returns `{archived}` |
@@ -50,7 +51,7 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 
 ## Agent tools
 
-Every agent gets the coding tools `read`, `write`, `edit` and `bash`, plus the playground tools `read_state`, `update_state`, `list_durable_jobs`, `run_durable_job`, `check_durable_job`, `search_history`, `ping_on_call_engineer`, `subagent`, `start_session` and `handoff`. `readOnly` removes the eight that write: `bash`, `write`, `edit`, `update_state`, `run_durable_job`, `ping_on_call_engineer`, `subagent` and `start_session`. `GET .../agents/:a` lists each tool with its replay policy and whether it is offered.
+Every agent gets the coding tools `read`, `write`, `edit` and `bash`, plus the playground tools `read_state`, `update_state`, `list_durable_jobs`, `run_durable_job`, `check_durable_job`, `search_history`, `ping_on_call_engineer`, `subagent`, `start_session` and `handoff`. `readOnly` removes the eight that write: `bash`, `write`, `edit`, `update_state`, `run_durable_job`, `ping_on_call_engineer`, `subagent` and `start_session`. `GET .../agents/:a` lists each tool with its replay policy and whether it is offered. Note: `update_state` can still create/edit any App State path *except* `/facts` — there is no agent tool for facts, so `homelab-incident` sessions see `/facts` only as the rendered `homelab-facts` prompt section (`src/facts.ts`), never as something they can write.
 
 ## Durable jobs
 

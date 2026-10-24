@@ -19,6 +19,7 @@ import {
 import type { Context } from "@earendil-works/chord";
 import { JobRuns, jobDef, resolveJobInput, type Jobs } from "./jobs.js";
 import { searchHistory } from "./history.js";
+import { isFactsPath } from "./facts.js";
 
 export const Workspace = defineDoc<AppState>({
   kind: "demo.workspace",
@@ -135,6 +136,9 @@ export function createPlayground(shared: SharedState, sessionId: string, spawn: 
     }),
     replay: "safe",
     execute: async (args, api, ctx) => {
+      // Homelab: /facts is written only through POST /v1/facts/:key (facts.ts), never by an agent.
+      if (isFactsPath(args.path))
+        throw Error("/facts is read-only here: it is written by homelab automation through the REST API, not by agents. Read it with read_state.");
       const next = await shared.change(
         {
           operation: args.operation,
