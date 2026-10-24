@@ -52,6 +52,19 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 
 Every agent gets the coding tools `read`, `write`, `edit` and `bash`, plus the playground tools `read_state`, `update_state`, `list_durable_jobs`, `run_durable_job`, `check_durable_job`, `search_history`, `ping_on_call_engineer`, `subagent`, `start_session` and `handoff`. `readOnly` removes the eight that write: `bash`, `write`, `edit`, `update_state`, `run_durable_job`, `ping_on_call_engineer`, `subagent` and `start_session`. `GET .../agents/:a` lists each tool with its replay policy and whether it is offered.
 
+The `homelab-incident` extension (off by default; pair it with `readOnly`) adds the incident tools:
+
+| Tool | Replay | Offered | What it does |
+|---|---|---|---|
+| `k8s_read {tool, verb?, resource, name?, namespace?, ...}` | safe | always | `kubectl get/describe/logs` or `flux get` as a view-only ServiceAccount, argv from allow-listed parts |
+| `save_rca {incident_id, severity, summary, root_cause, evidence, remediation, tags?}` | safe | always | writes App State `/incidents/<id>` (20 newest kept); with `JEV_API_URL` set, also POSTs `{session_id, rca, tags}` to Jev's `/incidents/<id>/rca`. `tags` (≤ 10 lowercase keywords) is offered only then and goes to Jev only. A Jev failure is noted in the result and never fails the tool |
+| `notify {title, message, priority?}` | unsafe | always | one ntfy post (`NTFY_URL`), 3 per agent |
+| `gitops_read {path}` | safe | `GITOPS_*` set | a homelab-gitops file or directory on Forgejo |
+| `propose_fix {incident_id, title, rationale, edits?, creates?, person_must?}` | unsafe | `GITOPS_*` set | opens a `jev/<id>` PR (or comments on the open one for the same alert), 3 per agent; with `JEV_API_URL` set, then POSTs `{pr_url}` to Jev, noting any failure (a `422` if `save_rca` never reached Jev) |
+| `search_past_incidents {alertname?, namespace?, query?}` | safe | `JEV_API_URL` set | `GET $JEV_API_URL/incidents/search` (`alertname`, `namespace`, `q`): up to 5 past RCAs from Jev's 90-day memory, most similar first, as leads to confirm with `k8s_read`. A Jev failure throws |
+
+Jev's calls send `Authorization: Bearer $DPI_TOKEN` with a 10 s timeout; the contract is homelab-gitops `docs/jev.md` §Incident memory. With `JEV_API_URL` set, the incident prompt also tells the agent to call `search_past_incidents` once, first, and to pass `tags` to `save_rca`. Unset, nothing calls Jev.
+
 ## Durable jobs
 
 A durable job is a repeatable workflow with named phases. Each run is one pi-durable task (`demo.job.<id>`) whose checkpoint phases are the job's phases, so a restart resumes the current phase. The run's record, with every phase and step (commands, a subagent's tool calls, App State writes, checkpoints, the approval), is the conversation document `demo.job-runs`; types are in [`../dpi-sdk/src/jobs.ts`](../dpi-sdk/src/jobs.ts). Every run saves its result to App State under `/jobs/<id>`.

@@ -7,7 +7,10 @@
 //   gitops_read, propose_fix   read homelab-gitops and open a fix PR on Forgejo (gitops.ts); offered only when
 //             GITOPS_API, GITOPS_REPO and GITOPS_TOKEN are set. Not write tools for Read only: they never touch the
 //             cluster or this pod, only a jev/ branch a person must merge.
-// Env: KUBECTL_BIN, FLUX_BIN (default kubectl, flux on PATH), NTFY_URL (e.g. http://ntfy.ntfy.svc.cluster.local/infra_alerts).
+//   search_past_incidents   Jev's incident memory (homelab-gitops docs/jev.md §Incident memory): past RCAs like this
+//             one. Offered only when JEV_API_URL is set; save_rca and propose_fix then also send Jev the RCA and PR.
+// Env: KUBECTL_BIN, FLUX_BIN (default kubectl, flux on PATH), NTFY_URL (e.g. http://ntfy.ntfy.svc.cluster.local/infra_alerts),
+// JEV_API_URL (e.g. http://jev.jev.svc.cluster.local:8081) with DPI_TOKEN as its bearer.
 import { execFile } from "node:child_process";
 import { Type } from "@earendil-works/pi-ai";
 import { defineDoc, defineExtension, defineTool, section, type ToolRegistration } from "@earendil-works/pi-durable";
@@ -122,6 +125,8 @@ export const INCIDENT_PROMPT = `You are investigating a homelab incident on the 
 - Use k8s_read for cluster facts: flux get (kustomizations, helmreleases, sources) first for Flux failures, then kubectl get/describe/logs on what they point at. k3s2 pod logs are not in Loki; kubectl logs is the only log source.
 - When you know the cause, call save_rca once, then notify once with a two-line summary. Do not guess: say what you could not confirm.`;
 
+export const MEMORY_PROMPT = `First call search_past_incidents once with the brief's alertname and namespace (and a short query from the summary). Treat matches as hypotheses and confirm them with k8s_read before citing them; they never replace the investigation, and a past cause is not this one until the cluster shows it. In save_rca, pass tags.`;
+
 export const FIX_PROMPT = `The cluster is deployed by Flux from the homelab-gitops repo; you can read it with gitops_read and propose one fix with propose_fix after save_rca.
 - Propose a fix only when the root cause is confirmed and a manifest change under apps/ or clusters/k3s2/ resolves it: a wrong image tag, ref, name, path, resource limit or missing manifest. gitops_read every file before you edit it and keep the change minimal.
 - Never put secret values in git. When a credential is missing, propose the OnePasswordItem or ExternalSecret manifest if that is what is missing, and say in person_must which 1Password item a person has to create.
@@ -145,7 +150,74 @@ async function postNtfy(headers: Record<string, string>, body: string) {
   if (!res.ok) throw Error(`ntfy HTTP ${res.status}`);
 }
 
-export function createIncident(shared: SharedState, sessionId: string, gitops = gitopsConfig()) {
+export type JevConfig = { url: string; token: string };
+
+export function jevConfig(env = process.env): JevConfig | undefined {
+  const url = env.JEV_API_URL?.replace(/\/+$/, "");
+  return url ? { url, token: env.DPI_TOKEN ?? "" } : undefined;
+}
+
+/** One call to Jev's api; throws on a network error or a non-2xx answer. */
+async function jevCall<T>(jev: JevConfig, method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${jev.url}${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${jev.token}`, "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const text = await res.text();
+  if (!res.ok) throw Error(`Jev HTTP ${res.status}${text ? ` ${clip(text, 300)}` : ""}`);
+  return (text ? JSON.parse(text) : undefined) as T;
+}
+
+const reason = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** Best effort: App State is the record, so a Jev failure only becomes a note in the tool result. */
+async function jevSaveRca(jev: JevConfig | undefined, id: string, body: Record<string, unknown>, what: string) {
+  if (!jev) return "";
+  try {
+    await jevCall(jev, "POST", `/incidents/${encodeURIComponent(id)}/rca`, body);
+    return "";
+  } catch (e) {
+    return ` Jev's incident memory did not take ${what}: ${reason(e)}.`;
+  }
+}
+
+type PastIncident = {
+  incident_id: string;
+  alertname?: string | null;
+  namespace?: string | null;
+  rca?: { summary?: string; root_cause?: string; remediation?: string } | null;
+  tags?: string[] | null;
+  pr_url?: string | null;
+  created_at?: string | null;
+  resolved_at?: string | null;
+  score?: number | null;
+};
+
+/** search_past_incidents' text: one block per incident. Exported for tests. */
+export function formatPastIncidents(incidents: PastIncident[]) {
+  if (!incidents.length) return "No similar past incidents.";
+  return incidents
+    .map((i) => {
+      const head = [
+        `${i.incident_id} (${i.alertname || "?"}/${i.namespace || "-"}) ${i.created_at ?? "?"} → ${i.resolved_at ?? "unresolved"}`,
+        ...(typeof i.score === "number" ? [`score ${i.score}`] : []),
+        `tags ${i.tags?.length ? i.tags.join(", ") : "none"}`,
+      ].join(", ");
+      const field = (label: string, v: unknown) => (typeof v === "string" && v ? [`${label}: ${clip(v, 400)}`] : []);
+      return [
+        head,
+        ...field("summary", i.rca?.summary),
+        ...field("root cause", i.rca?.root_cause),
+        ...field("remediation", i.rca?.remediation),
+        ...(i.pr_url ? [`PR: ${i.pr_url}`] : []),
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+export function createIncident(shared: SharedState, sessionId: string, gitops = gitopsConfig(), jev = jevConfig()) {
   const k8sRead = defineTool({
     name: "k8s_read",
     description:
@@ -182,7 +254,10 @@ export function createIncident(shared: SharedState, sessionId: string, gitops = 
       root_cause: Type.String(),
       evidence: Type.Array(Type.String(), { maxItems: 10 }),
       remediation: Type.String({ description: "what a person should do; you do not do it" }),
+      // Only for Jev's incident memory, not App State; offered only when Jev is.
+      ...(jev ? { tags: Type.Optional(Type.Array(Type.String(), { maxItems: 10, description: "lowercase keywords, e.g. flux, oom, nfs, cert" })) } : {}),
     }),
+    // Safe to replay: App State writes carry receipts, and Jev's upsert is idempotent.
     replay: "safe",
     execute: async (args, api) => {
       const id = check(args.incident_id, NAME, "incident_id")!;
@@ -207,7 +282,9 @@ export function createIncident(shared: SharedState, sessionId: string, gitops = 
       for (const [k] of old.slice(0, Math.max(0, old.length - (MAX_INCIDENTS - 1))))
         await shared.change({ operation: "delete", path: `/incidents/${k}` }, `${receipt}:prune:${k}`);
       await shared.change({ operation: id in incidents ? "update" : "create", path: `/incidents/${id}`, value: rca }, receipt);
-      return { content: [{ type: "text", text: `Saved the RCA to App State /incidents/${id}.` }] };
+      const tags = (args as { tags?: string[] }).tags ?? [];
+      const note = await jevSaveRca(jev, id, { session_id: sessionId, rca, tags }, "it");
+      return { content: [{ type: "text", text: `Saved the RCA to App State /incidents/${id}.${note}` }] };
     },
   });
 
@@ -281,6 +358,8 @@ export function createIncident(shared: SharedState, sessionId: string, gitops = 
           } catch (e) {
             note = ` The PR notification failed (${e instanceof Error ? e.message : e}); mention the PR in your notify call.`;
           }
+        // Jev keeps the stored RCA and fills in pr_url; a 422 means save_rca never reached it.
+        note += await jevSaveRca(jev, args.incident_id.toLowerCase(), { pr_url: r.url }, "the PR link");
         const what = r.kind === "opened" ? `Opened PR #${r.number} from ${r.branch}` : `PR #${r.number} for this alert was already open; added the fix as a comment`;
         return { content: [{ type: "text", text: `${what}: ${r.url}.${note}` }] };
       },
@@ -288,9 +367,38 @@ export function createIncident(shared: SharedState, sessionId: string, gitops = 
     tools.push(gitopsReadTool as ToolRegistration, proposeFixTool as ToolRegistration);
   }
 
+  if (jev) {
+    const searchTool = defineTool({
+      name: "search_past_incidents",
+      description:
+        "Search Jev's memory of past homelab incidents (90 days of RCAs) for ones like this. Returns up to 5, most similar first. Leads to check with k8s_read, not answers.",
+      parameters: Type.Object({
+        alertname: Type.Optional(Type.String({ description: "exact alertname from the brief" })),
+        namespace: Type.Optional(Type.String({ description: "exact namespace label, if any" })),
+        query: Type.Optional(Type.String({ maxLength: 500, description: "symptoms, error text, resource names" })),
+      }),
+      replay: "safe",
+      execute: async (args) => {
+        const params = new URLSearchParams();
+        for (const [key, value] of [["alertname", args.alertname], ["namespace", args.namespace], ["q", args.query]] as const)
+          if (value?.trim()) params.set(key, value.trim());
+        const qs = params.toString();
+        let found: { incidents?: PastIncident[] };
+        try {
+          found = await jevCall(jev, "GET", `/incidents/search${qs ? `?${qs}` : ""}`);
+        } catch (e) {
+          throw Error(`search_past_incidents: Jev's incident memory is unavailable (${reason(e)}). It is read-only, so retrying is safe; or investigate without it.`);
+        }
+        return { content: [{ type: "text", text: formatPastIncidents(found?.incidents ?? []) }] };
+      },
+    });
+    tools.push(searchTool as ToolRegistration);
+  }
+
+  const prompt = [INCIDENT_PROMPT, ...(jev ? [MEMORY_PROMPT] : []), ...(gitops ? [FIX_PROMPT] : [])].join("\n\n");
   return defineExtension({
     name: INCIDENT_NAME,
     tools,
-    sections: [section(INCIDENT_NAME, async () => (gitops ? `${INCIDENT_PROMPT}\n\n${FIX_PROMPT}` : INCIDENT_PROMPT), { tag: false })],
+    sections: [section(INCIDENT_NAME, async () => prompt, { tag: false })],
   });
 }
