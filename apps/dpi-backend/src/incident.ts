@@ -28,6 +28,8 @@ const KUBECTL_RESOURCES = new Set([
   "kustomizations.kustomize.toolkit.fluxcd.io", "helmreleases.helm.toolkit.fluxcd.io",
   "gitrepositories.source.toolkit.fluxcd.io", "helmrepositories.source.toolkit.fluxcd.io",
   "ocirepositories.source.toolkit.fluxcd.io", "helmcharts.source.toolkit.fluxcd.io",
+  // Read for the homelab-digest job (jobs.ts): backup/replication status only, never Secrets or PGDATA.
+  "backups.velero.io", "clusters.postgresql.cnpg.io",
 ]);
 const FLUX_KINDS: Record<string, string[]> = {
   all: ["all"],
@@ -94,7 +96,8 @@ export function k8sArgv(a: K8sReadArgs): { bin: string; argv: string[] } {
   };
 }
 
-function run(bin: string, argv: string[], signal?: AbortSignal) {
+/** Exported so the homelab-digest job (jobs.ts) can reuse the same validated argv without a shell. */
+export function run(bin: string, argv: string[], signal?: AbortSignal) {
   return new Promise<string>((resolve) => {
     execFile(bin, argv, { timeout: 30_000, maxBuffer: 4 * 1024 * 1024, signal, env: process.env }, (err, stdout, stderr) => {
       const out = `${stdout}${stderr ? `\n${stderr}` : ""}`.trim();
