@@ -104,6 +104,15 @@ export function restoreCreateArgv(opts: {
   };
 }
 
+/**
+ * The job pre-creates the scratch namespace itself (rather than letting `velero restore create` auto-create it)
+ * so this is a real create on the ServiceAccount the drill runs as, matching the create/delete RBAC it holds.
+ */
+export function scratchNamespaceCreateArgv(scratch: string): { bin: string; argv: string[] } {
+  assertScratch(scratch);
+  return { bin: kubectlBin(), argv: ["create", "namespace", scratch] };
+}
+
 export function scratchNamespaceDeleteArgv(scratch: string): { bin: string; argv: string[] } {
   assertScratch(scratch);
   return { bin: kubectlBin(), argv: ["delete", "namespace", scratch, "--wait", "--timeout=5m"] };

@@ -44,6 +44,7 @@ import {
   restoreGetArgv,
   restoreIsDone,
   scratchNamespace,
+  scratchNamespaceCreateArgv,
   scratchNamespaceDeleteArgv,
   scratchPodsAndPvcsArgv,
   type BackupPlan,
@@ -476,10 +477,29 @@ HANDLERS["velero-restore-drill"] = {
     const backupName = String(p.data.backupName);
     const namespace = String(p.data.namespace);
     const scratch = String(p.data.scratch);
+    // Pre-create the scratch namespace ourselves (rather than letting `velero restore create` auto-create it), so
+    // this is a real namespace create by this job's ServiceAccount, scoped by RBAC/admission to the velero-drill-
+    // prefix. A resumed phase after a crash here may find it already created; that is success, not an error.
+    await p.step("command", "kubectl create namespace (scratch)", async () => {
+      const { bin, argv } = scratchNamespaceCreateArgv(scratch);
+      try {
+        const out = await execBin(bin, argv);
+        return { value: out, detail: tail(out) || "created" };
+      } catch (e) {
+        if (/AlreadyExists/.test(String((e as Error)?.message))) return { value: "", detail: `${scratch} already exists (resumed)` };
+        throw e;
+      }
+    });
+    // Same tolerance here: a resumed phase may have already submitted this Restore before the earlier crash.
     await p.step("command", "velero restore create", async () => {
       const { bin, argv } = restoreCreateArgv({ restoreName, backupName, sourceNamespace: namespace, scratch });
-      const out = await execBin(bin, argv);
-      return { value: out, detail: tail(out) || "created" };
+      try {
+        const out = await execBin(bin, argv);
+        return { value: out, detail: tail(out) || "created" };
+      } catch (e) {
+        if (/AlreadyExists/.test(String((e as Error)?.message))) return { value: "", detail: `${restoreName} already submitted (resumed)` };
+        throw e;
+      }
     });
     return { done: `Restore ${restoreName} created into ${scratch}` };
   },

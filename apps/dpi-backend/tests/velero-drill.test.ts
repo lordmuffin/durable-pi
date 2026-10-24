@@ -20,6 +20,7 @@ import {
   restoreGetArgv,
   restoreIsDone,
   scratchNamespace,
+  scratchNamespaceCreateArgv,
   scratchNamespaceDeleteArgv,
   scratchPodsAndPvcsArgv,
 } from "../src/velero.js";
@@ -89,7 +90,9 @@ test("velero.ts: argv builders validate their inputs and never target outside th
   assert.equal(assertScratch(scratch), scratch);
   assert.throws(() => assertScratch("tandoor"), /not a .*scratch namespace/);
   assert.throws(() => scratchPodsAndPvcsArgv("tandoor"), /not a .*scratch namespace/);
+  assert.throws(() => scratchNamespaceCreateArgv("tandoor"), /not a .*scratch namespace/);
   assert.throws(() => scratchNamespaceDeleteArgv("tandoor"), /not a .*scratch namespace/);
+  assert.deepEqual(scratchNamespaceCreateArgv(scratch).argv, ["create", "namespace", scratch]);
   assert.throws(
     () => restoreCreateArgv({ restoreName: scratch, backupName: "b", sourceNamespace: "tandoor", scratch: "tandoor" }),
     /not a .*scratch namespace/,
@@ -130,7 +133,10 @@ else if (a[0] === "get" && a[1] === "restores.velero.io") {
   const done = Date.now() >= completesAt;
   send(JSON.stringify({ status: { phase: done ? "Completed" : "InProgress", warnings: 0, errors: 0 } }));
 } else if (a[0] === "get" && a[1] === "pods,pvc") send(fs.readFileSync(dir + "/scratch.json", "utf8"));
-else if (a[0] === "delete" && a[1] === "namespace") {
+else if (a[0] === "create" && a[1] === "namespace") {
+  fs.writeFileSync(dir + "/created-" + a[2], "1");
+  send('namespace/' + a[2] + ' created\\n');
+} else if (a[0] === "delete" && a[1] === "namespace") {
   fs.writeFileSync(dir + "/deleted-" + a[2], "1");
   send('namespace "' + a[2] + '" deleted\\n');
 } else {
@@ -210,6 +216,7 @@ test("SIGKILL mid-restore resumes the velero-restore-drill job from its checkpoi
       const done = await run();
       assert.deepEqual(done.phases.map((p) => p.status), ["done", "done", "done", "done", "done", "done", "done"]);
       const scratch = `velero-drill-tandoor-${taskId}`;
+      assert.equal(await readFile(join(fakeDir, `created-${scratch}`), "utf8"), "1");
       assert.equal(await readFile(join(fakeDir, `deleted-${scratch}`), "utf8"), "1");
       const history = await main.entries({ scope: "all" });
       assert.equal(history.items.filter((e) => e.kind === "demo.job").length, 1);
