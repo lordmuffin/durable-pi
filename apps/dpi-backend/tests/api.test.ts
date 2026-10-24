@@ -96,6 +96,7 @@ test("REST v1: auth, sessions, agents, messages, waits, idempotency, errors", as
       "release-check",
       "change-watch",
       "approve-irreversible",
+      "velero-restore-drill",
       "homelab-digest",
       "profile-verify",
     ]);
