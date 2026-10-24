@@ -1,4 +1,5 @@
 import { SharedState } from "./shared-state.js";
+import { checkFactSource, checkFactValue, factDef, type FactEntry } from "./facts.js";
 import type { StateChange } from "../../dpi-sdk/src/app-state.js";
 import type {
   AgentDetail,
@@ -962,6 +963,28 @@ export class Store {
     if (kind !== "app.shared-state") throw notFound(`Unknown device document ${kind}`);
     const { value, revision } = await this.shared.snapshot();
     return { value, revision };
+  }
+
+  // ------------------------------------------------------------ facts (homelab)
+
+  /**
+   * The only way to change a fact: no agent tool writes /facts, only this REST-only path (see
+   * routes.ts POST /v1/facts/:key), so agents read facts but never edit them except through the
+   * jobs that own them. `key` must be one of FACT_SCHEMA; `value` must match its declared type.
+   * A stale `expectedRevision` throws the same "App State changed..." error deviceState writes
+   * do, which errors.ts turns into 409 conflict — callers re-read and retry.
+   */
+  async writeFact(key: string, value: unknown, source: unknown, expectedRevision?: number) {
+    const def = factDef(key);
+    const checked = checkFactValue(def, value);
+    const checkedSource = checkFactSource(source);
+    const entry: FactEntry = { value: checked, updatedAt: new Date().toISOString(), source: checkedSource };
+    const { value: state } = await this.shared.snapshot();
+    if (!Object.hasOwn(state, "facts")) await this.shared.change({ operation: "create", path: "/facts", value: {} });
+    const facts = ((await this.shared.snapshot()).value as { facts: Record<string, unknown> }).facts;
+    const op = Object.hasOwn(facts, key) ? "update" : "create";
+    await this.shared.change({ operation: op, path: `/facts/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`, value: entry as unknown as StateChange["value"] }, undefined, expectedRevision);
+    return { ok: true as const, key, ...entry };
   }
 
   async usage(h: Harness): Promise<UsageTotals> {
