@@ -99,7 +99,7 @@ export const ADDON_INFO: Omit<HarnessExtensionInfo, "enabled" | "prompts">[] = [
     name: INCIDENT_NAME,
     title: "Homelab incident",
     description:
-      "k8s_read (kubectl get/describe/logs, flux get as a view-only ServiceAccount), save_rca (App State /incidents only) and notify (ntfy). With GITOPS_* set, also gitops_read and propose_fix (a fix PR on homelab-gitops for a person to merge). Pair it with Read only.",
+      "k8s_read (kubectl get/describe/logs, flux get as a view-only ServiceAccount), save_rca (App State /incidents only) and notify (ntfy). With GITOPS_* set, also gitops_read and propose_fix (a fix PR on homelab-gitops for a person to merge). With JEV_API_URL set, also search_past_incidents, and RCAs and PR links go to Jev's incident memory. Pair it with Read only.",
   },
 ];
 
