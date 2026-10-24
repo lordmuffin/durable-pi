@@ -58,6 +58,10 @@ export async function bootServer(opts: { home: string; startDirs: string; token:
         DPI_ENV_FILE: resolve(opts.home, "none.env"),
         DPI_TOKEN: opts.token,
         DPI_PROVIDER: "faux",
+        // The `--port` flag wins over this for the actual listener (config.ts), but code that reads
+        // process.env.DPI_PORT directly for a self-call (jobs.ts's homelab-digest writeFact) needs it
+        // to actually match, so it isn't accidentally reaching for the default 4780.
+        DPI_PORT: String(port),
         DPI_START_DIRS: opts.startDirs,
         DPI_DEVICE_NAME: opts.name ?? "test-device",
         ...opts.env,
