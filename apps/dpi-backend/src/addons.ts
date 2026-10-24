@@ -10,6 +10,7 @@ import { defineDoc, defineExtension, hook, section, ToolTask, type Extension } f
 import type { HarnessExtensionInfo } from "../../dpi-sdk/src/api.js";
 import { askJev, type JevAnswer, type JevQuestion } from "./jev.js";
 import { createIncident, INCIDENT_NAME } from "./incident.js";
+import { createPrReview, PR_REVIEW_NAME } from "./pr-review.js";
 import type { SharedState } from "./shared-state.js";
 
 const PROMPTS_DIR = join(import.meta.dirname, "../prompts");
@@ -101,6 +102,12 @@ export const ADDON_INFO: Omit<HarnessExtensionInfo, "enabled" | "prompts">[] = [
     description:
       "k8s_read (kubectl get/describe/logs, flux get as a view-only ServiceAccount), save_rca (App State /incidents only) and notify (ntfy). With GITOPS_* set, also gitops_read and propose_fix (a fix PR on homelab-gitops for a person to merge). Pair it with Read only.",
   },
+  {
+    name: PR_REVIEW_NAME,
+    title: "Homelab PR review",
+    description:
+      "Started by Jev's POST /forgejo for a labelled or jev/ pull request on homelab-gitops. pr_checks (kubectl kustomize plus a tests/tdd subset against a fetched scratch checkout) and pr_comment (one comment per PR, edited in place on a later push). No approve, merge or label change. Offered only with REVIEW_API/REVIEW_REPO/REVIEW_TOKEN set. Pair it with Read only.",
+  },
 ];
 
 export function createAddons(opts: { offline: boolean; shared: SharedState; sessionId: string }) {
@@ -144,8 +151,11 @@ export function createAddons(opts: { offline: boolean; shared: SharedState; sess
     ],
   });
   const incident = createIncident(opts.shared, opts.sessionId);
-  const all: Record<string, Extension> = { "system-prompts": prompts, "jev-damage-control": jev, [INCIDENT_NAME]: incident };
-  return { all, list: [prompts, jev, incident] };
+  const prReview = createPrReview();
+  const all: Record<string, Extension> = {
+    "system-prompts": prompts, "jev-damage-control": jev, [INCIDENT_NAME]: incident, [PR_REVIEW_NAME]: prReview,
+  };
+  return { all, list: [prompts, jev, incident, prReview] };
 }
 
 export type Addons = ReturnType<typeof createAddons>;

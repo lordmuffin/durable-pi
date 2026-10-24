@@ -21,6 +21,7 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 | `GET /v1/events` | `?docs=app.shared-state` | device stream |
 | `GET /v1/fs/dirs` | `?path=` (empty = start dirs) | `{path, parent, dirs[]}`, one level, directories only |
 | `GET /v1/docs/app.shared-state` | | `{kind, value, revision}` |
+| `POST /v1/facts/:key` | `{value, source, expectedRevision?}` | `{ok, key, value, updatedAt, source}`: writes App State `/facts/:key`. `key` must be one of the fixed keys in `src/facts.ts` (`FACT_SCHEMA`); `value` must match that key's declared type (string ≤200 chars, number, or boolean); `source` is a short label, ≤100 chars. A stale `expectedRevision` returns `409 conflict` — re-read `GET /v1/docs/app.shared-state` and retry. This is the *only* way to change a fact: no agent tool writes `/facts` (`facts_write` is a REST-only capability), so agents read facts (via `read_state` or this GET) but edit them only through the automation that owns each key |
 | `GET /v1/sessions` | | `SessionSummary[]` |
 | `POST /v1/sessions` | `{name, cwd, model:{provider,modelId}, thinkingLevel?}` | `201 SessionSummary` |
 | `GET / PATCH / DELETE /v1/sessions/:s` | PATCH `{name}` | summary (with its `compaction` thresholds); DELETE aborts all work, moves the files to `archive/` and returns `{archived}` |
@@ -50,11 +51,11 @@ The contract every Durable Agent Network client uses: the web hub, `dpi-tui`, sc
 
 ## Agent tools
 
-Every agent gets the coding tools `read`, `write`, `edit` and `bash`, plus the playground tools `read_state`, `update_state`, `list_durable_jobs`, `run_durable_job`, `check_durable_job`, `search_history`, `ping_on_call_engineer`, `subagent`, `start_session` and `handoff`. `readOnly` removes the eight that write: `bash`, `write`, `edit`, `update_state`, `run_durable_job`, `ping_on_call_engineer`, `subagent` and `start_session`. `GET .../agents/:a` lists each tool with its replay policy and whether it is offered.
+Every agent gets the coding tools `read`, `write`, `edit` and `bash`, plus the playground tools `read_state`, `update_state`, `list_durable_jobs`, `run_durable_job`, `check_durable_job`, `search_history`, `ping_on_call_engineer`, `subagent`, `start_session` and `handoff`. `readOnly` removes the eight that write: `bash`, `write`, `edit`, `update_state`, `run_durable_job`, `ping_on_call_engineer`, `subagent` and `start_session`. `GET .../agents/:a` lists each tool with its replay policy and whether it is offered. Note: `update_state` can still create/edit any App State path *except* `/facts` — there is no agent tool for facts, so `homelab-incident` sessions see `/facts` only as the rendered `homelab-facts` prompt section (`src/facts.ts`), never as something they can write.
 
 ## Durable jobs
 
-A durable job is a repeatable workflow with named phases. Each run is one pi-durable task (`demo.job.<id>`) whose checkpoint phases are the job's phases, so a restart resumes the current phase. The run's record, with every phase and step (commands, a subagent's tool calls, App State writes, checkpoints, the approval), is the conversation document `demo.job-runs`; types are in [`../dpi-sdk/src/jobs.ts`](../dpi-sdk/src/jobs.ts). Every run saves its result to App State under `/jobs/<id>`.
+A durable job is a repeatable workflow with named phases. Each run is one pi-durable task (`demo.job.<id>`) whose checkpoint phases are the job's phases, so a restart resumes the current phase. The run's record, with every phase and step (commands, a subagent's tool calls, App State writes, checkpoints, the approval), is the conversation document `demo.job-runs`; types are in [`../dpi-sdk/src/jobs.ts`](../dpi-sdk/src/jobs.ts). Every run saves its result to App State under `/jobs/<id>`, except `homelab-digest`, which uses `/digest/<date>` and `/digest/previous` (below).
 
 | Job | Phases | Inputs |
 |---|---|---|
@@ -63,6 +64,7 @@ A durable job is a repeatable workflow with named phases. Each run is one pi-dur
 | `change-watch` | baseline → watch (one checkpoint per check) → report | `path`, `checks`, `interval_seconds` |
 | `approve-irreversible` | request → approve (waits for a person) → execute | `command`, `reason` |
 | `velero-restore-drill` | pick → plan → approve (waits) → restore → verify → cleanup-approve (waits) → cleanup | `namespace`, `location` |
+| `homelab-digest` | collect (validated kubectl/flux reads only, no shell/bash) → compare (diff vs. App State `/digest/previous`) → interpret (one tool-free model call) → publish (`/digest/<date>`, `/digest/previous`, one ntfy line) | `model` (LiteLLM chat model id for interpret) |
 
 Agents use the playground tools: `list_durable_jobs` (ids, phases, inputs, approval, result path and recent runs with their task ids), `run_durable_job {job, input?, wait?}` and `check_durable_job {task_id? | job?}` (one run's phases, steps and result, a job's latest run, or recent runs). A run starts in the background, owned by the conversation; with `wait: true` the call owns it and waits, so an interrupt stops it. The same extension adds `search_history {query?, tool?, entry?, kind?, from_entry?, to_entry?, order?, limit?, offset?}`, which pages through the agent's whole stored history including entries before a reset or compaction, and `ping_on_call_engineer {summary, severity?}`, a simulated pager (no external call) that is not replay-safe and works once per agent.
 
