@@ -139,6 +139,13 @@ test("homelab-digest: collects every section without a shell, calls the model on
     assert.ok(state.digest?.previous, "digest.previous saved");
     const dated = Object.keys(state.digest ?? {}).filter((k) => k !== "previous");
     assert.equal(dated.length, 1, "exactly one dated snapshot");
+
+    // publish also self-calls POST /v1/facts/lastDigestDate and lastDigestNeededPerson (docs/pi-durable.md
+    // "Facts") -- best-effort, so check the actual fact values it wrote, not just that the step didn't throw.
+    const facts = (state as { facts?: Record<string, { value: unknown; source: string }> }).facts ?? {};
+    assert.equal(facts.lastDigestDate?.value, dated[0]);
+    assert.equal(facts.lastDigestDate?.source, "homelab-digest");
+    assert.equal(facts.lastDigestNeededPerson?.value, false);
   } finally {
     await f.cleanup();
   }
@@ -162,6 +169,8 @@ test("homelab-digest: a failing section is reported, not hidden, and still publi
     assert.match(b2Step?.detail ?? "", /STALE/);
     assert.equal(f.ntfy.calls.length, 1);
     assert.equal(f.ntfy.calls[0].headers.priority, "default", "needs-a-person digest is not low priority");
+    const state = (await f.client.deviceDoc("app.shared-state")).value as { facts?: Record<string, { value: unknown }> };
+    assert.equal(state.facts?.lastDigestNeededPerson?.value, true);
   } finally {
     await f.cleanup();
   }

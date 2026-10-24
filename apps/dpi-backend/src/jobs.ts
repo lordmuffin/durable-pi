@@ -752,6 +752,26 @@ async function checkHarbor(): Promise<Section> {
   return { ok: true, summary: "Harbor cache hit stats: no cheap read available (needs Harbor API credentials); skipped by design" };
 }
 
+/**
+ * Self-calls this device's own POST /v1/facts/:key (facts.ts) with DPI_TOKEN -- the same device token every
+ * /v1/* route needs, already in this process's env for Jev calls. Never throws: a facts write is best-effort
+ * (docs/pi-durable.md "Facts"), same as the GPU workflows and pi-durable-facts-tick.
+ */
+async function writeFact(key: string, value: string | number | boolean): Promise<boolean> {
+  try {
+    const base = `http://127.0.0.1:${process.env.DPI_PORT ?? "4780"}`;
+    const res = await fetch(`${base}/v1/facts/${encodeURIComponent(key)}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${process.env.DPI_TOKEN ?? ""}`, "content-type": "application/json" },
+      body: JSON.stringify({ value, source: "homelab-digest" }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function fluxReadiness(resource: string) {
   const { bin, argv } = K8S_JSON(resource);
   const items = (JSON.parse(await k8sRun(bin, argv)).items ?? []) as Array<{
@@ -1055,6 +1075,14 @@ HANDLERS["homelab-digest"] = {
       });
       if (!res.ok) throw Error(`ntfy HTTP ${res.status}`);
       return { value: undefined, detail: topic };
+    });
+    // docs/pi-durable.md "Facts": lastDigestDate/lastDigestNeededPerson are this job's own keys. Self-call
+    // POST /v1/facts/:key (never update_state -- that path is refused for agents, see facts.ts#isFactsPath)
+    // the same way the GPU workflows and pi-durable-facts-tick do: best-effort, no expectedRevision, a
+    // failure here is a stale fact (marked [STALE] once past its own threshold), never a failed run.
+    await p.step("tool", "write /facts/lastDigestDate and lastDigestNeededPerson", async () => {
+      const ok = await Promise.all([writeFact("lastDigestDate", date), writeFact("lastDigestNeededPerson", needsPerson)]);
+      return { value: ok, detail: ok.every(Boolean) ? `${date}, needsPerson=${needsPerson}` : "one or more facts writes failed (best-effort, not fatal)" };
     });
     return { done: `Published /digest/${date} and /digest/previous` };
   },
