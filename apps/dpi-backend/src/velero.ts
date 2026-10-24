@@ -1,6 +1,17 @@
 // velero-restore-drill: argv builders and output parsers for the kubectl/velero calls the job makes. Every call is
-// built from validated parts here, never a shell string — the same shape as incident.ts's k8sArgv. Exported for tests.
+// built from validated parts here, never a shell string — the same shape as incident.ts's k8sArgv.
+//
+// Identity: the pod's own ServiceAccount is pi-durable-reader (read-only, shared with homelab-incident's k8s_read).
+// A Kubernetes Pod binds exactly one ServiceAccount, so this job cannot simply run as a second one — instead the
+// pod's ambient identity is used only to mint a short-lived token for the drill's own ServiceAccount
+// (`kubectl create token`, RBAC-limited to creating a token for that one named ServiceAccount — see
+// velero-drill-rbac.yaml's `serviceaccounts/token` rule in the homelab repo), and every real backup/restore/
+// namespace call below runs against that minted token via a throwaway kubeconfig, so it is pi-durable-velero-drill,
+// not pi-durable-reader, that the API server authorizes and audits for all of it. Exported for tests.
 import { execFile } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const NAME = /^[a-z0-9]([a-z0-9.\-]{0,251}[a-z0-9])?$/;
 const MAX_OUTPUT = 200_000;
@@ -9,6 +20,13 @@ export const DRILL_PREFIX = process.env.VELERO_DRILL_PREFIX ?? "velero-drill-";
 export const veleroNamespace = () => process.env.VELERO_NAMESPACE ?? "velero";
 export const kubectlBin = () => process.env.KUBECTL_BIN ?? "kubectl";
 export const veleroBin = () => process.env.VELERO_BIN ?? "velero";
+
+export const drillServiceAccount = () => process.env.VELERO_DRILL_SERVICE_ACCOUNT ?? "pi-durable-velero-drill";
+export const drillServiceAccountNamespace = () => process.env.VELERO_DRILL_SERVICE_ACCOUNT_NAMESPACE ?? "pi-durable";
+const k8sCaFile = () => process.env.VELERO_DRILL_CA_FILE ?? "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt";
+const k8sServer = () =>
+  process.env.VELERO_DRILL_K8S_SERVER ??
+  (process.env.KUBERNETES_SERVICE_HOST ? `https://${process.env.KUBERNETES_SERVICE_HOST}:${process.env.KUBERNETES_SERVICE_PORT ?? "443"}` : "https://kubernetes.default.svc");
 
 const check = (value: string, pattern: RegExp, what: string) => {
   if (!pattern.test(value)) throw Error(`Invalid ${what}: ${JSON.stringify(value)}`);
@@ -48,6 +66,49 @@ export async function execBin(bin: string, argv: string[]): Promise<string> {
   const { code, out } = await runBin(bin, argv);
   if (code !== 0) throw Error(`${bin} ${argv.join(" ")}: exit ${code}: ${out.trim().split("\n").slice(-8).join("\n")}`);
   return out;
+}
+
+/**
+ * Mint a short-lived token for the drill ServiceAccount, write it to a throwaway kubeconfig, and run one argv
+ * against it — so this call is authorized and audited as pi-durable-velero-drill, not as the pod's own identity.
+ * The mint itself (`kubectl create token`) runs with the pod's ambient in-cluster identity and no extra flags.
+ */
+export async function execAsDrill(bin: string, argv: string[], durationSeconds = 600): Promise<string> {
+  const token = (
+    await execBin(kubectlBin(), ["create", "token", drillServiceAccount(), "-n", drillServiceAccountNamespace(), `--duration=${durationSeconds}s`])
+  ).trim();
+  if (!token) throw Error("kubectl create token returned no token");
+  const dir = await mkdtemp(join(tmpdir(), "velero-drill-"));
+  try {
+    const kubeconfig = join(dir, "config");
+    await writeFile(
+      kubeconfig,
+      [
+        "apiVersion: v1",
+        "kind: Config",
+        "clusters:",
+        "  - name: k3s2",
+        "    cluster:",
+        `      server: "${k8sServer()}"`,
+        `      certificate-authority: "${k8sCaFile()}"`,
+        "contexts:",
+        "  - name: drill",
+        "    context:",
+        "      cluster: k3s2",
+        `      user: "${drillServiceAccount()}"`,
+        "current-context: drill",
+        "users:",
+        `  - name: "${drillServiceAccount()}"`,
+        "    user:",
+        `      token: "${token}"`,
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    );
+    return await execBin(bin, [...argv, `--kubeconfig=${kubeconfig}`]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
 
 // ------------------------------------------------------------------ argv builders (read)

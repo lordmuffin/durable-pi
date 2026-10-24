@@ -33,7 +33,7 @@ import type { SharedState } from "./shared-state.js";
 import { hardDeny } from "./guard.js";
 import {
   backupsListArgv,
-  execBin,
+  execAsDrill,
   newestCompletedBackup,
   parseBackups,
   parsePodVolumeBackups,
@@ -438,7 +438,7 @@ HANDLERS["velero-restore-drill"] = {
     const location = String(p.input.location);
     const backups = await p.step("command", "kubectl get backups.velero.io", async () => {
       const { bin, argv } = backupsListArgv();
-      const out = await execBin(bin, argv);
+      const out = await execAsDrill(bin, argv);
       return { value: parseBackups(out), detail: `${JSON.parse(out).items?.length ?? 0} backups` };
     });
     const backup = newestCompletedBackup(backups, namespace, location);
@@ -453,7 +453,7 @@ HANDLERS["velero-restore-drill"] = {
     const backupName = String(p.data.backupName);
     const plan = await p.step("command", "kubectl get podvolumebackups.velero.io", async () => {
       const { bin, argv } = podVolumeBackupsArgv(backupName);
-      const out = await execBin(bin, argv);
+      const out = await execAsDrill(bin, argv);
       const parsed = parsePodVolumeBackups(out);
       return { value: parsed, detail: `${parsed.pods.length} pods, ${parsed.volumes.length} volumes` };
     });
@@ -483,7 +483,7 @@ HANDLERS["velero-restore-drill"] = {
     await p.step("command", "kubectl create namespace (scratch)", async () => {
       const { bin, argv } = scratchNamespaceCreateArgv(scratch);
       try {
-        const out = await execBin(bin, argv);
+        const out = await execAsDrill(bin, argv);
         return { value: out, detail: tail(out) || "created" };
       } catch (e) {
         if (/AlreadyExists/.test(String((e as Error)?.message))) return { value: "", detail: `${scratch} already exists (resumed)` };
@@ -494,7 +494,7 @@ HANDLERS["velero-restore-drill"] = {
     await p.step("command", "velero restore create", async () => {
       const { bin, argv } = restoreCreateArgv({ restoreName, backupName, sourceNamespace: namespace, scratch });
       try {
-        const out = await execBin(bin, argv);
+        const out = await execAsDrill(bin, argv);
         return { value: out, detail: tail(out) || "created" };
       } catch (e) {
         if (/AlreadyExists/.test(String((e as Error)?.message))) return { value: "", detail: `${restoreName} already submitted (resumed)` };
@@ -510,7 +510,7 @@ HANDLERS["velero-restore-drill"] = {
       const deadline = p.now() + 10 * 60_000;
       for (;;) {
         const { bin, argv } = restoreGetArgv(restoreName);
-        const out = await execBin(bin, argv);
+        const out = await execAsDrill(bin, argv);
         const s = parseRestoreStatus(out);
         if (restoreIsDone(s)) return { value: s, detail: `phase ${s.phase}, ${s.warnings} warnings, ${s.errors} errors` };
         if (p.now() > deadline) throw Error(`restore ${restoreName} did not finish within 10m (last phase ${s.phase})`);
@@ -520,7 +520,7 @@ HANDLERS["velero-restore-drill"] = {
     if (status.phase === "Failed") throw Error(`restore ${restoreName} failed: ${status.errors} error(s) (velero restore describe ${restoreName} --details)`);
     const counts = await p.step("command", "kubectl get pods,pvc -n (scratch)", async () => {
       const { bin, argv } = scratchPodsAndPvcsArgv(scratch);
-      const out = await execBin(bin, argv);
+      const out = await execAsDrill(bin, argv);
       const parsed = parseScratchCounts(out);
       return { value: parsed, detail: `${parsed.pods} pods, ${parsed.pvcsBound}/${parsed.pvcs} PVCs bound` };
     });
@@ -549,7 +549,7 @@ HANDLERS["velero-restore-drill"] = {
     const scratch = String(p.data.scratch);
     await p.step("command", "kubectl delete namespace (scratch)", async () => {
       const { bin, argv } = scratchNamespaceDeleteArgv(scratch);
-      const out = await execBin(bin, argv);
+      const out = await execAsDrill(bin, argv);
       return { value: out, detail: tail(out) || "deleted" };
     });
     const plan = (p.data.plan ?? { pods: [], volumes: [] }) as BackupPlan;

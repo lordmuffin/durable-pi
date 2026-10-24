@@ -126,7 +126,8 @@ const fs = require("fs");
 const dir = process.env.FAKE_STATE_DIR;
 const a = process.argv.slice(2);
 const send = (text) => process.stdout.write(text);
-if (a[0] === "get" && a[1] === "backups.velero.io") send(fs.readFileSync(dir + "/backups.json", "utf8"));
+if (a[0] === "create" && a[1] === "token") send("fake-token-" + a[2] + "\\n");
+else if (a[0] === "get" && a[1] === "backups.velero.io") send(fs.readFileSync(dir + "/backups.json", "utf8"));
 else if (a[0] === "get" && a[1] === "podvolumebackups.velero.io") send(fs.readFileSync(dir + "/pvbs.json", "utf8"));
 else if (a[0] === "get" && a[1] === "restores.velero.io") {
   const completesAt = Number(fs.readFileSync(dir + "/completes_at", "utf8"));
