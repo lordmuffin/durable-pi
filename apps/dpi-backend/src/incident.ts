@@ -1,14 +1,18 @@
-// homelab-incident: the three tools an incident session gets on top of upstream's read-only tools.
+// homelab-incident: the tools an incident session gets on top of upstream's read-only tools.
 //   k8s_read  kubectl get/describe/logs and flux get, built as argv (no shell) from allow-listed parts. It runs as
 //             the pod's ServiceAccount, which holds the `view` ClusterRole plus read on Flux CRDs, so it cannot write
 //             or read Secrets whatever the arguments.
 //   save_rca  writes one incident's RCA under App State /incidents/<id>; no other path is writable.
 //   notify    posts one message to the ntfy topic (NTFY_URL), at most a few times per agent.
+//   gitops_read, propose_fix   read homelab-gitops and open a fix PR on Forgejo (gitops.ts); offered only when
+//             GITOPS_API, GITOPS_REPO and GITOPS_TOKEN are set. Not write tools for Read only: they never touch the
+//             cluster or this pod, only a jev/ branch a person must merge.
 // Env: KUBECTL_BIN, FLUX_BIN (default kubectl, flux on PATH), NTFY_URL (e.g. http://ntfy.ntfy.svc.cluster.local/infra_alerts).
 import { execFile } from "node:child_process";
 import { Type } from "@earendil-works/pi-ai";
-import { defineDoc, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
+import { defineDoc, defineExtension, defineTool, section, type ToolRegistration } from "@earendil-works/pi-durable";
 import type { SharedState } from "./shared-state.js";
+import { gitopsConfig, gitopsRead, proposeFix, type FixArgs } from "./gitops.js";
 
 export const INCIDENT_NAME = "homelab-incident";
 
@@ -118,7 +122,30 @@ export const INCIDENT_PROMPT = `You are investigating a homelab incident on the 
 - Use k8s_read for cluster facts: flux get (kustomizations, helmreleases, sources) first for Flux failures, then kubectl get/describe/logs on what they point at. k3s2 pod logs are not in Loki; kubectl logs is the only log source.
 - When you know the cause, call save_rca once, then notify once with a two-line summary. Do not guess: say what you could not confirm.`;
 
-export function createIncident(shared: SharedState, sessionId: string) {
+export const FIX_PROMPT = `The cluster is deployed by Flux from the homelab-gitops repo; you can read it with gitops_read and propose one fix with propose_fix after save_rca.
+- Propose a fix only when the root cause is confirmed and a manifest change under apps/ or clusters/k3s2/ resolves it: a wrong image tag, ref, name, path, resource limit or missing manifest. gitops_read every file before you edit it and keep the change minimal.
+- Never put secret values in git. When a credential is missing, propose the OnePasswordItem or ExternalSecret manifest if that is what is missing, and say in person_must which 1Password item a person has to create.
+- Skip propose_fix when the fix is outside git (hardware, storage, a registry, a value only a person has) or you are unsure; the RCA remediation covers it. propose_fix notifies on its own, so your notify call should just mention the PR.`;
+
+/** propose_fix works this many times per agent; a rejected change (bad path, no match) uses one too. */
+const FIX_LIMIT = 3;
+const Proposed = defineDoc<{ count: number }>({
+  kind: "incident.proposed",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({ count: 0 }),
+});
+
+async function postNtfy(headers: Record<string, string>, body: string) {
+  const url = process.env.NTFY_URL;
+  if (!url) throw Error("NTFY_URL is not set on this device");
+  const res = await fetch(url, { method: "POST", headers, body: clip(body, 1500), signal: AbortSignal.timeout(10_000) });
+  if (!res.ok) throw Error(`ntfy HTTP ${res.status}`);
+}
+
+export function createIncident(shared: SharedState, sessionId: string, gitops = gitopsConfig()) {
   const k8sRead = defineTool({
     name: "k8s_read",
     description:
@@ -194,27 +221,76 @@ export function createIncident(shared: SharedState, sessionId: string) {
       priority: Type.Optional(Type.Union([Type.Literal("default"), Type.Literal("high"), Type.Literal("urgent")])),
     }),
     execute: async (args, api, ctx) => {
-      const url = process.env.NTFY_URL;
-      if (!url) throw Error("NTFY_URL is not set on this device");
+      if (!process.env.NTFY_URL) throw Error("NTFY_URL is not set on this device");
       await api.commit(async (tx) => {
         const doc = await tx.doc(Notified, api.conversationId);
         if (doc.count >= NOTIFY_LIMIT) throw Error(`notify already used ${NOTIFY_LIMIT} times by this agent`);
         doc.count++;
       }, ctx);
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { Title: clip(args.title, 80), Priority: args.priority ?? "default", Tags: "robot,mag" },
-        body: clip(args.message, 1500),
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!res.ok) throw Error(`ntfy HTTP ${res.status}`);
+      await postNtfy({ Title: clip(args.title, 80), Priority: args.priority ?? "default", Tags: "robot,mag" }, args.message);
       return { content: [{ type: "text", text: "Posted to ntfy." }] };
     },
   });
 
+  const tools = [k8sRead, saveRca, notify] as ToolRegistration[];
+  if (gitops) {
+    const gitopsReadTool = defineTool({
+      name: "gitops_read",
+      description: `Read the homelab-gitops repo (what Flux deploys) on ${gitops.base}: a file's text, or a directory listing. path "" lists the root.`,
+      parameters: Type.Object({ path: Type.String({ description: "repo path, e.g. apps/ai/jev or clusters/k3s2/ai/jev.yaml" }) }),
+      replay: "safe",
+      execute: async (args) => ({ content: [{ type: "text", text: await gitopsRead(gitops, args.path) }] }),
+    });
+
+    // No replay policy: a crash mid-call returns an interrupted result and never opens a second PR.
+    const proposeFixTool = defineTool({
+      name: "propose_fix",
+      description: `Open a pull request on homelab-gitops with a fix for this incident, then send a notification linking it. Writes only a new jev/<incident_id> branch; a person reviews and merges. Only apps/ and clusters/k3s2/ YAML/JSON/MD, never flux-system, apps/secrets or SOPS files, never secret values. If a PR for the same alert is open, comments on it instead. Works ${FIX_LIMIT} times per agent.`,
+      parameters: Type.Object({
+        incident_id: Type.String({ description: "the id from the brief, e.g. inc-1a2b3c4d-20261023t1206" }),
+        title: Type.String({ description: "PR title, under 80 characters, imperative" }),
+        rationale: Type.String({ description: "root cause and why this change fixes it, with the evidence" }),
+        edits: Type.Optional(
+          Type.Array(
+            Type.Object({
+              path: Type.String(),
+              old_string: Type.String({ description: "exact text from gitops_read, unique in the file" }),
+              new_string: Type.String(),
+            }),
+            { maxItems: 8 },
+          ),
+        ),
+        creates: Type.Optional(Type.Array(Type.Object({ path: Type.String(), content: Type.String() }), { maxItems: 4 })),
+        person_must: Type.Optional(Type.String({ description: "steps outside git a person must do first, e.g. create a 1Password item" })),
+      }),
+      execute: async (args, api, ctx) => {
+        await api.commit(async (tx) => {
+          const doc = await tx.doc(Proposed, api.conversationId);
+          if (doc.count >= FIX_LIMIT) throw Error(`propose_fix already used ${FIX_LIMIT} times by this agent`);
+          doc.count++;
+        }, ctx);
+        const r = await proposeFix(gitops, args as FixArgs, { session: sessionId });
+        api.output(`${r.kind} PR #${r.number}: ${r.url}\n`);
+        let note = "";
+        if (r.kind === "opened")
+          try {
+            await postNtfy(
+              { Title: clip(`PR #${r.number}: ${args.title}`, 80), Priority: "default", Tags: "robot,wrench", Click: r.url },
+              `${args.incident_id}\n${clip(args.rationale, 600)}${args.person_must ? `\n\nFirst: ${args.person_must}` : ""}`,
+            );
+          } catch (e) {
+            note = ` The PR notification failed (${e instanceof Error ? e.message : e}); mention the PR in your notify call.`;
+          }
+        const what = r.kind === "opened" ? `Opened PR #${r.number} from ${r.branch}` : `PR #${r.number} for this alert was already open; added the fix as a comment`;
+        return { content: [{ type: "text", text: `${what}: ${r.url}.${note}` }] };
+      },
+    });
+    tools.push(gitopsReadTool as ToolRegistration, proposeFixTool as ToolRegistration);
+  }
+
   return defineExtension({
     name: INCIDENT_NAME,
-    tools: [k8sRead, saveRca, notify],
-    sections: [section(INCIDENT_NAME, async () => INCIDENT_PROMPT, { tag: false })],
+    tools,
+    sections: [section(INCIDENT_NAME, async () => (gitops ? `${INCIDENT_PROMPT}\n\n${FIX_PROMPT}` : INCIDENT_PROMPT), { tag: false })],
   });
 }
