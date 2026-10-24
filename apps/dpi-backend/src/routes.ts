@@ -67,6 +67,13 @@ export function v1(store: Store) {
       res.json({ kind, ...(await store.deviceDoc(kind)) });
     }),
   );
+  // facts_write: writing /facts is only reachable here, never as an agent tool — see facts.ts.
+  r.post(
+    "/facts/:key",
+    route(async (req, res) => {
+      res.json(await store.writeFact(param(req, "key"), req.body?.value, req.body?.source, req.body?.expectedRevision));
+    }),
+  );
 
   // ---------------------------------------------------------- sessions
   r.get("/sessions", route(async (_req, res) => res.json((await store.tree()).sessions)));
