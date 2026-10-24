@@ -10,7 +10,7 @@ import { defineDoc, defineExtension, hook, section, ToolTask, type Extension } f
 import type { HarnessExtensionInfo } from "../../dpi-sdk/src/api.js";
 import { askJev, type JevAnswer, type JevQuestion } from "./jev.js";
 import { createIncident, INCIDENT_NAME } from "./incident.js";
-import { createGpuProfiles, GPU_PROFILE_NAME } from "./gpu-profile-tool.js";
+import { createPrReview, PR_REVIEW_NAME } from "./pr-review.js";
 import type { SharedState } from "./shared-state.js";
 
 const PROMPTS_DIR = join(import.meta.dirname, "../prompts");
@@ -103,10 +103,10 @@ export const ADDON_INFO: Omit<HarnessExtensionInfo, "enabled" | "prompts">[] = [
       "k8s_read (kubectl get/describe/logs, flux get as a view-only ServiceAccount), save_rca (App State /incidents only) and notify (ntfy). With GITOPS_* set, also gitops_read and propose_fix (a fix PR on homelab-gitops for a person to merge). Pair it with Read only.",
   },
   {
-    name: GPU_PROFILE_NAME,
-    title: "Homelab GPU profiles",
+    name: PR_REVIEW_NAME,
+    title: "Homelab PR review",
     description:
-      "propose_profile_change: open a PR switching a workload-swap GPU node (andrew-gamingpc, lxc-k3s2-gpu-a) to a different active profile. Never runs swap.py, kubectl apply, or gaming-on/off itself; a person merges and the node's deploy workflow converges it. Offered only when GITOPS_* is set.",
+      "Started by Jev's POST /forgejo for a labelled or jev/ pull request on homelab-gitops. pr_checks (kubectl kustomize plus a tests/tdd subset against a fetched scratch checkout) and pr_comment (one comment per PR, edited in place on a later push). No approve, merge or label change. Offered only with REVIEW_API/REVIEW_REPO/REVIEW_TOKEN set. Pair it with Read only.",
   },
 ];
 
@@ -151,14 +151,11 @@ export function createAddons(opts: { offline: boolean; shared: SharedState; sess
     ],
   });
   const incident = createIncident(opts.shared, opts.sessionId);
-  const gpuProfiles = createGpuProfiles(opts.sessionId);
+  const prReview = createPrReview();
   const all: Record<string, Extension> = {
-    "system-prompts": prompts,
-    "jev-damage-control": jev,
-    [INCIDENT_NAME]: incident,
-    [GPU_PROFILE_NAME]: gpuProfiles,
+    "system-prompts": prompts, "jev-damage-control": jev, [INCIDENT_NAME]: incident, [PR_REVIEW_NAME]: prReview,
   };
-  return { all, list: [prompts, jev, incident, gpuProfiles] };
+  return { all, list: [prompts, jev, incident, prReview] };
 }
 
 export type Addons = ReturnType<typeof createAddons>;
