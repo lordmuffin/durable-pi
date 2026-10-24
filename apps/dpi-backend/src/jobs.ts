@@ -29,8 +29,10 @@ import {
   type JobStep,
   type JobStepKind,
 } from "../../dpi-sdk/src/jobs.js";
+import { connect } from "node:net";
 import type { SharedState } from "./shared-state.js";
 import { hardDeny } from "./guard.js";
+import { k8sArgv, run as k8sRun } from "./incident.js";
 import { gitopsConfig, gitopsRead } from "./gitops.js";
 import { NODE_FILES, profileBudget } from "./gpu-profiles.js";
 import { chatOnce, fetchNodeStatus, findWorkflowRun, membersReady, pollPrMerged, tokensPerSecond } from "./gpu-verify.js";
@@ -138,6 +140,29 @@ export const JOB_DEFS: JobDef[] = [
     approval: true,
     resultPath: `/${RESULT_ROOT}/approve-irreversible`,
     seconds: 10,
+  },
+  {
+    id: "homelab-digest",
+    title: "Homelab nightly digest",
+    summary:
+      "Collect Velero, CNPG/barman, B2, NFS, Harbor and Flux/pod health with validated kubectl/flux reads (no shell, no bash), diff it against last night, have a model write a short plain-language summary, then publish one App State snapshot and one ntfy line.",
+    phases: [
+      { id: "collect", label: "Collect", summary: "Deterministic reads: Velero, CNPG/barman, B2, NFS, Harbor, Flux, pods" },
+      { id: "compare", label: "Compare", summary: "Diff this snapshot against App State /digest/previous" },
+      { id: "interpret", label: "Interpret", summary: "One model call writes the summary; it calls no tools" },
+      { id: "publish", label: "Publish", summary: "Save /digest/<date> and /digest/previous, post one ntfy line" },
+    ],
+    inputs: [
+      {
+        name: "model",
+        type: "string",
+        default: "qwen3.8-flash-next",
+        description: "LiteLLM chat model id the interpret phase calls directly (no tools, no bash)",
+      },
+    ],
+    approval: false,
+    resultPath: `/digest/previous`,
+    seconds: 20,
   },
   {
     id: "profile-verify",
@@ -412,6 +437,200 @@ HANDLERS["approve-irreversible"] = {
   },
 };
 
+// ------------------------------------------------------------------ homelab-digest: one check per section, never throws
+//
+// homelab-digest env: NTFY_URL (same infra_alerts-shaped topic as homelab-incident), OPENAI_BASE_URL / OPENAI_API_KEY
+// (the LiteLLM endpoint every agent already uses), DIGEST_NFS_HOST (default 192.168.1.10). collect never runs a shell:
+// every kubectl/flux call goes through incident.ts's k8sArgv + run, the same validated argv builder k8s_read uses.
+
+/** One digest section: `ok` decides whether it needs a person; `error` is set only when the read itself failed. */
+type Section = { ok: boolean; summary: string; detail?: JsonValue; error?: string };
+
+const errorOf = (e: unknown) => clip(String((e as Error)?.message ?? e), 300);
+const K8S_JSON = (resource: string, extra: Partial<Parameters<typeof k8sArgv>[0]> = {}) =>
+  k8sArgv({ tool: "kubectl", verb: "get", resource, all_namespaces: true, output: "json", ...extra });
+
+async function checkVelero(now: number): Promise<Section> {
+  try {
+    const { bin, argv } = K8S_JSON("backups.velero.io");
+    const items = (JSON.parse(await k8sRun(bin, argv)).items ?? []) as Array<{
+      metadata?: { name?: string; namespace?: string };
+      status?: { phase?: string; startTimestamp?: string };
+    }>;
+    const cutoff = now - 24 * 3600 * 1000;
+    const recent = items.filter((b) => Date.parse(b.status?.startTimestamp ?? "") >= cutoff);
+    const byPhase: Record<string, number> = {};
+    for (const b of recent) byPhase[b.status?.phase ?? "Unknown"] = (byPhase[b.status?.phase ?? "Unknown"] ?? 0) + 1;
+    const failed = recent
+      .filter((b) => !["Completed", "Finished"].includes(b.status?.phase ?? ""))
+      .map((b) => b.metadata?.name ?? "(unnamed)");
+    return {
+      ok: failed.length === 0,
+      summary: recent.length
+        ? `${recent.length} backup(s) in 24h: ${Object.entries(byPhase).map(([k, n]) => `${k} ${n}`).join(", ")}`
+        : "No Velero backups started in the last 24h",
+      detail: { count: recent.length, byPhase, failed },
+    };
+  } catch (e) {
+    return { ok: false, summary: "Velero Backups: read failed", error: errorOf(e) };
+  }
+}
+
+async function checkCnpg(): Promise<Section> {
+  try {
+    const { bin, argv } = K8S_JSON("clusters.postgresql.cnpg.io");
+    const items = (JSON.parse(await k8sRun(bin, argv)).items ?? []) as Array<{
+      metadata?: { name?: string; namespace?: string };
+      status?: { conditions?: Array<{ type?: string; status?: string }>; lastSuccessfulBackupTime?: string };
+    }>;
+    const clusters = items.map((c) => {
+      const cond = (type: string) => c.status?.conditions?.find((x) => x.type === type)?.status;
+      return {
+        name: `${c.metadata?.namespace}/${c.metadata?.name}`,
+        continuousArchiving: cond("ContinuousArchiving") ?? "Unknown",
+        lastBackupSucceeded: cond("LastBackupSucceeded") ?? "Unknown",
+        lastSuccessfulBackupTime: c.status?.lastSuccessfulBackupTime ?? null,
+      };
+    });
+    const unhealthy = clusters.filter((c) => c.continuousArchiving === "False" || c.lastBackupSucceeded === "False");
+    return {
+      ok: unhealthy.length === 0,
+      summary: clusters.length
+        ? `${clusters.length} CNPG cluster(s); ${unhealthy.length ? `${unhealthy.map((c) => c.name).join(", ")} unhealthy` : "barman healthy"}`
+        : "No CNPG clusters found",
+      detail: clusters as unknown as JsonValue,
+    };
+  } catch (e) {
+    return { ok: false, summary: "CNPG / barman status: read failed", error: errorOf(e) };
+  }
+}
+
+/** Reads the latest b2-backup-monitor Job's log, which already states STALE/SHRANK/OK; this never re-derives it from B2 itself. */
+async function checkB2(): Promise<Section> {
+  try {
+    const jobsArgv = k8sArgv({ tool: "kubectl", verb: "get", resource: "jobs", namespace: "backup-monitor", output: "json" });
+    const jobs = (JSON.parse(await k8sRun(jobsArgv.bin, jobsArgv.argv)).items ?? []) as Array<{
+      metadata?: { name?: string };
+      status?: { startTime?: string };
+    }>;
+    if (!jobs.length) return { ok: false, summary: "B2 offsite backup: no Job history in backup-monitor", error: "no jobs found" };
+    jobs.sort((a, b) => Date.parse(a.status?.startTime ?? "") - Date.parse(b.status?.startTime ?? ""));
+    const name = jobs[jobs.length - 1].metadata?.name ?? "";
+    const podsArgv = k8sArgv({ tool: "kubectl", verb: "get", resource: "pods", namespace: "backup-monitor", selector: `job-name=${name}`, output: "json" });
+    const pods = (JSON.parse(await k8sRun(podsArgv.bin, podsArgv.argv)).items ?? []) as Array<{ metadata?: { name?: string } }>;
+    const podName = pods[0]?.metadata?.name;
+    if (!podName) return { ok: false, summary: `B2 offsite backup: no pod for job ${name}`, error: "pod not found" };
+    const logsArgv = k8sArgv({ tool: "kubectl", verb: "logs", resource: "pods", name: podName, namespace: "backup-monitor", tail: 100 });
+    const logs = await k8sRun(logsArgv.bin, logsArgv.argv);
+    const flagged = logs.match(/^.*\b(STALE|SHRANK)\b.*$/m)?.[0];
+    const age = logs.match(/([\d.]+)\s*days?\s*old/i)?.[1];
+    return {
+      ok: !flagged,
+      summary: flagged ? `B2 offsite backup: ${clip(flagged.trim(), 200)}` : `B2 offsite backup OK${age ? `, newest object ${age}d old` : ""}`,
+      detail: { job: name },
+    };
+  } catch (e) {
+    return { ok: false, summary: "B2 offsite backup: read failed", error: errorOf(e) };
+  }
+}
+
+/** One TCP connect per port, best-effort. The real alarm (nfs-health-monitor) retries and keeps the best of several; this is a snapshot, not a replacement for it. */
+function tcpProbe(host: string, port: number, timeoutMs = 3000): Promise<{ ok: boolean; ms: number }> {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const sock = connect({ host, port, timeout: timeoutMs });
+    const done = (ok: boolean) => {
+      sock.destroy();
+      resolve({ ok, ms: Date.now() - start });
+    };
+    sock.once("connect", () => done(true));
+    sock.once("timeout", () => done(false));
+    sock.once("error", () => done(false));
+  });
+}
+
+async function checkNfs(): Promise<Section> {
+  try {
+    const host = process.env.DIGEST_NFS_HOST ?? "192.168.1.10";
+    const nfsdPort = Number(process.env.DIGEST_NFS_PORT ?? 2049);
+    const rpcbindPort = Number(process.env.DIGEST_RPCBIND_PORT ?? 111);
+    const [nfsd, rpcbind] = await Promise.all([tcpProbe(host, nfsdPort), tcpProbe(host, rpcbindPort)]);
+    const verdict = nfsd.ok ? (nfsd.ms > 1000 ? "SLOW" : "healthy") : rpcbind.ok ? "SATURATED" : "NAS UNREACHABLE";
+    return {
+      ok: verdict === "healthy",
+      summary: `NFS (${host}): ${verdict} — nfsd ${nfsd.ok ? `answered in ${nfsd.ms}ms` : "refused"}, rpcbind ${rpcbind.ok ? "answered" : "refused"}`,
+      detail: { nfsd, rpcbind, verdict },
+    };
+  } catch (e) {
+    return { ok: false, summary: "NFS reachability: probe failed", error: errorOf(e) };
+  }
+}
+
+/** Harbor's hit-rate needs its own API credentials (docs/harbor-pull-through-cache.md); no cheap read exists today, so this says so rather than guessing or omitting the section. */
+async function checkHarbor(): Promise<Section> {
+  return { ok: true, summary: "Harbor cache hit stats: no cheap read available (needs Harbor API credentials); skipped by design" };
+}
+
+async function fluxReadiness(resource: string) {
+  const { bin, argv } = K8S_JSON(resource);
+  const items = (JSON.parse(await k8sRun(bin, argv)).items ?? []) as Array<{
+    metadata?: { name?: string; namespace?: string };
+    status?: { conditions?: Array<{ type?: string; status?: string }> };
+  }>;
+  let ready = 0;
+  const notReady: string[] = [];
+  for (const item of items) {
+    const status = item.status?.conditions?.find((c) => c.type === "Ready")?.status;
+    if (status === "True") ready++;
+    else notReady.push(`${item.metadata?.namespace}/${item.metadata?.name}`);
+  }
+  return { ready, notReady };
+}
+
+async function checkFlux(): Promise<Section> {
+  try {
+    const [ks, hr] = await Promise.all([
+      fluxReadiness("kustomizations.kustomize.toolkit.fluxcd.io"),
+      fluxReadiness("helmreleases.helm.toolkit.fluxcd.io"),
+    ]);
+    const notReady = [...ks.notReady, ...hr.notReady];
+    return {
+      ok: notReady.length === 0,
+      summary: `Flux: Kustomizations ${ks.ready} ready${ks.notReady.length ? `, not ready: ${ks.notReady.join(", ")}` : ""}; HelmReleases ${hr.ready} ready${hr.notReady.length ? `, not ready: ${hr.notReady.join(", ")}` : ""}`,
+      detail: { kustomizations: ks, helmreleases: hr },
+    };
+  } catch (e) {
+    return { ok: false, summary: "Flux readiness: read failed", error: errorOf(e) };
+  }
+}
+
+async function checkPods(now: number): Promise<Section> {
+  try {
+    const { bin, argv } = K8S_JSON("pods");
+    const items = (JSON.parse(await k8sRun(bin, argv)).items ?? []) as Array<{
+      metadata?: { name?: string; namespace?: string; creationTimestamp?: string };
+      status?: { phase?: string; startTime?: string; conditions?: Array<{ type?: string; status?: string; lastTransitionTime?: string }> };
+    }>;
+    const cutoff = now - 3600 * 1000;
+    const stuck = items
+      .filter((pod) => {
+        if (pod.status?.phase === "Succeeded") return false;
+        const ready = pod.status?.conditions?.find((c) => c.type === "Ready");
+        if (ready?.status === "True") return false;
+        const since = Date.parse(ready?.lastTransitionTime ?? pod.status?.startTime ?? pod.metadata?.creationTimestamp ?? "");
+        return Number.isFinite(since) && since <= cutoff;
+      })
+      .map((pod) => `${pod.metadata?.namespace}/${pod.metadata?.name}`);
+    return {
+      ok: stuck.length === 0,
+      summary: stuck.length ? `${stuck.length} pod(s) not Ready for over 1h: ${stuck.slice(0, 10).join(", ")}` : "All pods Ready (or younger than 1h)",
+      detail: { stuck: stuck.slice(0, 20) },
+    };
+  } catch (e) {
+    return { ok: false, summary: "Pod readiness: read failed", error: errorOf(e) };
+  }
+}
+
 // profile-verify env: DASHBOARD_API (default https://dgx-spark-dashboard.lab.apj.dev), OPENAI_BASE_URL/
 // OPENAI_API_KEY (the device's own LiteLLM endpoint, same as every other agent call), NTFY_URL (report only; the
 // device never has approval topics for this job since nothing it does is irreversible). Every call is a plain
@@ -555,6 +774,110 @@ function checksums(out: string) {
   }
   return map;
 }
+
+HANDLERS["homelab-digest"] = {
+  collect: async (p) => {
+    const section = (label: string, fn: () => Promise<Section>) =>
+      p.step("tool", label, async () => {
+        const result = await fn();
+        return { value: result, detail: result.summary };
+      });
+    const sections: Record<string, Section> = {
+      velero: await section("Velero Backups (24h)", () => checkVelero(p.now())),
+      cnpg: await section("CNPG / barman status", checkCnpg),
+      b2: await section("B2 offsite backup", checkB2),
+      nfs: await section("NFS reachability", checkNfs),
+      harbor: await section("Harbor cache stats", checkHarbor),
+      flux: await section("Flux readiness", checkFlux),
+      pods: await section("Pods not Ready >1h", () => checkPods(p.now())),
+    };
+    const needsPerson = Object.entries(sections).filter(([, s]) => !s.ok).map(([k]) => k);
+    return {
+      done: needsPerson.length ? `Collected; needs a person: ${needsPerson.join(", ")}` : "Collected; all sections healthy",
+      data: { sections },
+    };
+  },
+  compare: async (p) => {
+    const sections = p.data.sections as Record<string, Section>;
+    const previous = (await p.readState("/digest/previous")) as { sections?: Record<string, Section> } | undefined;
+    const before = previous?.sections ?? {};
+    const diffs: string[] = [];
+    for (const [key, after] of Object.entries(sections)) {
+      const was = before[key];
+      if (!was) diffs.push(`${key}: first run (${after.ok ? "ok" : "needs attention"})`);
+      else if (was.ok !== after.ok) diffs.push(`${key}: ${was.ok ? "ok" : "needs attention"} → ${after.ok ? "ok" : "needs attention"}`);
+    }
+    return { done: diffs.length ? `${diffs.length} change(s) since last run` : "No change since last run", data: { diffs } };
+  },
+  // Deliberately tool-free: one chat completion against the LiteLLM endpoint every agent already uses, never Phase.agent()
+  // (which hands a subagent bash+read). A model outage fails this phase; it never fails collect or compare.
+  interpret: async (p) => {
+    const sections = p.data.sections as Record<string, Section>;
+    const diffs = (p.data.diffs ?? []) as string[];
+    const needsPerson = Object.values(sections).some((s) => !s.ok);
+    const payload = JSON.stringify(
+      { sections: Object.fromEntries(Object.entries(sections).map(([k, s]) => [k, { ok: s.ok, summary: s.summary, error: s.error }])), diffs },
+      null,
+      2,
+    );
+    const narrative = await p.step("tool", `Interpret (${p.input.model})`, async () => {
+      const base = (process.env.OPENAI_BASE_URL ?? "").replace(/\/+$/, "");
+      if (!base) throw Error("OPENAI_BASE_URL is not set on this device");
+      const res = await fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${process.env.OPENAI_API_KEY ?? "none"}` },
+        body: JSON.stringify({
+          model: String(p.input.model),
+          messages: [
+            {
+              role: "system",
+              content:
+                "You write a short plain-language homelab nightly digest from a JSON health snapshot and a list of changes since last night. Under 10 short lines. Say what changed and what needs a person to act; never invent a cause the data does not show. No secrets, no raw logs, no markdown tables.",
+            },
+            { role: "user", content: payload },
+          ],
+        }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!res.ok) throw Error(`model HTTP ${res.status}`);
+      const body = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+      const text = body.choices?.[0]?.message?.content?.trim();
+      if (!text) throw Error("model returned no content");
+      return { value: text, detail: clip(text, 200) };
+    });
+    return { done: clip(narrative.split("\n").find((l) => l.trim()) ?? "Interpreted", 120), data: { narrative, needsPerson } };
+  },
+  publish: async (p) => {
+    const date = new Date(p.now()).toISOString().slice(0, 10);
+    const snapshot = {
+      run: p.run.n,
+      at: new Date(p.now()).toISOString(),
+      sections: p.data.sections,
+      diffs: p.data.diffs ?? [],
+      narrative: p.data.narrative ?? "",
+    };
+    await p.saveState(`/digest/${date}`, snapshot);
+    await p.saveState(`/digest/previous`, snapshot);
+    const needsPerson = Boolean(p.data.needsPerson);
+    await p.step("tool", "notify (ntfy)", async () => {
+      const topic = process.env.NTFY_URL;
+      if (!topic) return { value: undefined, detail: "NTFY_URL not set; skipped" };
+      const res = await fetch(topic, {
+        method: "POST",
+        headers: {
+          Title: `Homelab nightly digest - run #${p.run.n}`,
+          Priority: needsPerson ? "default" : "min",
+          Tags: needsPerson ? "warning,bar_chart" : "bar_chart",
+        },
+        body: clip(String(p.data.narrative ?? ""), 1500),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!res.ok) throw Error(`ntfy HTTP ${res.status}`);
+      return { value: undefined, detail: topic };
+    });
+    return { done: `Published /digest/${date} and /digest/previous` };
+  },
+};
 
 // ------------------------------------------------------------------ run record helpers
 

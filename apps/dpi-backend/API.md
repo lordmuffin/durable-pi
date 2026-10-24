@@ -55,13 +55,14 @@ Every agent gets the coding tools `read`, `write`, `edit` and `bash`, plus the p
 
 ## Durable jobs
 
-A durable job is a repeatable workflow with named phases. Each run is one pi-durable task (`demo.job.<id>`) whose checkpoint phases are the job's phases, so a restart resumes the current phase. The run's record, with every phase and step (commands, a subagent's tool calls, App State writes, checkpoints, the approval), is the conversation document `demo.job-runs`; types are in [`../dpi-sdk/src/jobs.ts`](../dpi-sdk/src/jobs.ts). Every run saves its result to App State under `/jobs/<id>`.
+A durable job is a repeatable workflow with named phases. Each run is one pi-durable task (`demo.job.<id>`) whose checkpoint phases are the job's phases, so a restart resumes the current phase. The run's record, with every phase and step (commands, a subagent's tool calls, App State writes, checkpoints, the approval), is the conversation document `demo.job-runs`; types are in [`../dpi-sdk/src/jobs.ts`](../dpi-sdk/src/jobs.ts). Every run saves its result to App State under `/jobs/<id>`, except `homelab-digest`, which uses `/digest/<date>` and `/digest/previous` (below).
 
 | Job | Phases | Inputs |
 |---|---|---|
 | `workspace-snapshot` | scan → measure → save → verify | `path` |
 | `release-check` | plan → gather (subagent with read and bash) → approve (waits for a person) → publish → verify | `commits` |
 | `change-watch` | baseline → watch (one checkpoint per check) → report | `path`, `checks`, `interval_seconds` |
+| `homelab-digest` | collect (validated kubectl/flux reads only, no shell/bash) → compare (diff vs. App State `/digest/previous`) → interpret (one tool-free model call) → publish (`/digest/<date>`, `/digest/previous`, one ntfy line) | `model` (LiteLLM chat model id for interpret) |
 
 Agents use the playground tools: `list_durable_jobs` (ids, phases, inputs, approval, result path and recent runs with their task ids), `run_durable_job {job, input?, wait?}` and `check_durable_job {task_id? | job?}` (one run's phases, steps and result, a job's latest run, or recent runs). A run starts in the background, owned by the conversation; with `wait: true` the call owns it and waits, so an interrupt stops it. The same extension adds `search_history {query?, tool?, entry?, kind?, from_entry?, to_entry?, order?, limit?, offset?}`, which pages through the agent's whole stored history including entries before a reset or compaction, and `ping_on_call_engineer {summary, severity?}`, a simulated pager (no external call) that is not replay-safe and works once per agent.
 
